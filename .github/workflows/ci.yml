@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: shellcheck wsl/bootstrap.sh
+      - run: python3 -m py_compile mcp/server.py
+      - run: docker compose -f wsl/compose.yaml config -q
+
+  mcp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: docker build -t aias-mcp mcp
+      - run: docker run -d --name aias-mcp -p 127.0.0.1:11400:11400 aias-mcp
+      - name: Health and tool list
+        run: |
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:11400/health && break; sleep 1; done
+          tools=$(curl -fsS http://127.0.0.1:11400/mcp \
+            -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq -r '.result.tools[].name' | sort | tr '\n' ' ')
+          echo "tools: $tools"
+          test "$tools" = "job_status logs model_down model_list model_pull model_up status "
+      - name: Foreign Host header is refused
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:11400/mcp -H 'Host: evil.example' \
+            -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')
+          echo "status $code"
+          test "$code" -ge 400
+      - if: failure()
+        run: docker logs aias-mcp
+
+  installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build setup.exe
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          & $iscc installer\aias.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aias-setup
+          path: installer/Output/*.exe
