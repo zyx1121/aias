@@ -40,7 +40,8 @@ mcp = MCPServer(
     instructions=(
         "Local model host on one NVIDIA GPU. Two engines: ollama (names like qwen3:8b) "
         "and vllm (Hugging Face ids like Qwen/Qwen3-0.6B). Only one model is up at a time; "
-        "model_up stops whatever else is running. Pulls and startups are jobs: poll job_status. "
+        "model_up stops whatever else is running. Pulls and startups are jobs, one at a time: "
+        "poll job_status until it finishes before starting the next. "
         "Once a model is up, call it through the OpenAI compatible base_url that status returns."
     ),
 )
@@ -187,7 +188,23 @@ class Job:
 JOBS: dict[str, Job] = {}
 
 
+def _busy() -> Job | None:
+    return next((j for j in JOBS.values() if j.state == "running"), None)
+
+
+def _refuse_if_busy() -> None:
+    # One job at a time: a pull may start the ollama server and an up stops the
+    # other engine, so overlapping jobs could leave two engines on one GPU.
+    if (job := _busy()) is not None:
+        raise RuntimeError(
+            f"job {job.id} ({job.kind} {job.model}) is still running; "
+            "wait for it with job_status, then retry"
+        )
+
+
 def _start_job(job: Job, work: Any) -> dict[str, Any]:
+    _refuse_if_busy()
+
     async def runner() -> None:
         try:
             job.detail = await work(job) or "done"
@@ -354,7 +371,8 @@ async def model_up(
 
 @mcp.tool()
 async def model_down() -> dict[str, Any]:
-    """Stop every engine and free the GPU."""
+    """Stop every engine and free the GPU. Refused while a job is running."""
+    _refuse_if_busy()
     await asyncio.to_thread(_stop, *ENGINES)
     return {"stopped": list(ENGINES), "gpu": await asyncio.to_thread(_gpu)}
 

@@ -15,6 +15,8 @@ DisableProgramGroupPage=yes
 PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+; WSL 2 with `wsl --install --no-distribution` needs Windows 10 22H2 or later.
+MinVersion=10.0.19045
 OutputBaseFilename=aias-setup-{#AppVersion}
 Compression=lzma2
 SolidCompression=yes
@@ -35,6 +37,7 @@ Filename: "powershell.exe"; \
 [Code]
 var
   RebootNeeded: Boolean;
+  InstallExitCode: Integer;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 var
@@ -51,10 +54,20 @@ begin
     if Code = 3010 then
       RebootNeeded := True
     else if Code <> 0 then
-      MsgBox('aias setup did not finish (exit code ' + IntToStr(Code) + ').' + #13#10 +
+    begin
+      InstallExitCode := Code;
+      if not WizardSilent then
+        MsgBox('aias setup did not finish (exit code ' + IntToStr(Code) + ').' + #13#10 +
              'Log: ' + ExpandConstant('{commonappdata}\aias\install.log') + #13#10 +
              'Run setup again after fixing the cause.', mbError, MB_OK);
+    end;
   end;
+end;
+
+// Silent installs report a failed install.ps1 through setup's own exit code.
+function GetCustomSetupExitCode(): Integer;
+begin
+  Result := InstallExitCode;
 end;
 
 function NeedRestart(): Boolean;

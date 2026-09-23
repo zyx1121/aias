@@ -20,10 +20,35 @@ $Resume     = 'aias-resume'
 $RootfsBase = 'https://cloud-images.ubuntu.com/wsl/releases/24.04/current'
 $RootfsName = 'ubuntu-noble-wsl-amd64-24.04lts.rootfs.tar.gz'
 
-New-Item -ItemType Directory -Force $DataDir, $CacheDir | Out-Null
+$Trusted = 'S-1-5-18', 'S-1-5-32-544', ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+
+# ProgramData lets any user create folders, so a user could pre-create ours and
+# swap the rootfs before import. Refuse a folder we do not own, then lock it to
+# SYSTEM and Administrators.
+if (Test-Path $DataDir) {
+  $owner = (Get-Acl $DataDir).GetOwner([Security.Principal.SecurityIdentifier]).Value
+  if ($Trusted -notcontains $owner) {
+    Write-Host "$DataDir exists and is owned by $owner, not an administrator. Remove it and run setup again." -ForegroundColor Red
+    exit 1
+  }
+} else {
+  New-Item -ItemType Directory $DataDir | Out-Null
+}
+& icacls.exe $DataDir /setowner '*S-1-5-32-544' /T /C /Q | Out-Null
+& icacls.exe $DataDir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /T /C /Q | Out-Null
+if ($LASTEXITCODE -ne 0) { Write-Host "Could not restrict access to $DataDir" -ForegroundColor Red; exit 1 }
+New-Item -ItemType Directory -Force $CacheDir | Out-Null
 Start-Transcript -Path (Join-Path $DataDir 'install.log') -Append | Out-Null
 
 function Step($msg) { Write-Host "`n==> $msg" -ForegroundColor Cyan }
+
+function Get-NativeExit {
+  # Exit code of a probe whose output we discard. With the script-wide 'Stop',
+  # Windows PowerShell turns any stderr line of a native command into an error.
+  $ErrorActionPreference = 'Continue'
+  & $args[0] @($args | Select-Object -Skip 1) *> $null
+  return $LASTEXITCODE
+}
 
 function Invoke-Wsl {
   # --exec skips the distro's shell, so arguments arrive exactly as given.
@@ -34,8 +59,7 @@ function Invoke-Wsl {
 function Test-WslReady {
   $vmp = Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform
   if ($vmp.State -ne 'Enabled') { return $false }
-  & wsl.exe --version *> $null
-  return $LASTEXITCODE -eq 0
+  return (Get-NativeExit wsl.exe --version) -eq 0
 }
 
 function Register-Resume {
@@ -74,8 +98,7 @@ try {
   Step 'Checking other distros for Docker'
   $running = @(& wsl.exe --list --running --quiet | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -ne $Distro })
   foreach ($d in $running) {
-    & wsl.exe -d $d -u root --exec pgrep -x dockerd *> $null
-    if ($LASTEXITCODE -eq 0) {
+    if ((Get-NativeExit wsl.exe -d $d -u root --exec pgrep -x dockerd) -eq 0) {
       throw "Docker is running in WSL distro '$d'. Stop it first: wsl -d $d -u root systemctl disable --now docker.service docker.socket"
     }
   }
@@ -117,8 +140,7 @@ try {
   Register-ScheduledTask -TaskName $KeepAlive -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
   Start-ScheduledTask -TaskName $KeepAlive
   for ($i = 0; $i -lt 30; $i++) {
-    & wsl.exe -d $Distro -u root --exec systemctl is-system-running --wait *> $null
-    if ($LASTEXITCODE -ne 255) { break }  # 255 means the distro is not up yet
+    if ((Get-NativeExit wsl.exe -d $Distro -u root --exec systemctl is-system-running --wait) -ne 255) { break }  # 255 means the distro is not up yet
     Start-Sleep 2
   }
 
