@@ -59,7 +59,7 @@ Any other MCP client:
 | `model_list` | Models already on disk, per engine, with size |
 | `model_pull` | Download an Ollama model (`qwen3:8b`) or a Hugging Face repo for vLLM (`Qwen/Qwen3-0.6B`); returns a job |
 | `model_up` | Load a model and stop any other engine; returns a job |
-| `model_down` | Stop every engine and free the GPU |
+| `model_down` | Stop every engine and free the GPU; cancels a running job |
 | `job_status` | Progress of a pull or up job; waits up to 120 s for it to finish |
 | `logs` | Recent log lines of an engine |
 

@@ -20,23 +20,68 @@ $Resume     = 'aias-resume'
 $RootfsBase = 'https://cloud-images.ubuntu.com/wsl/releases/24.04/current'
 $RootfsName = 'ubuntu-noble-wsl-amd64-24.04lts.rootfs.tar.gz'
 
-$Trusted = 'S-1-5-18', 'S-1-5-32-544', ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+# ProgramData lets any user create folders, so a user could plant ours (or a
+# folder inside it) and swap the rootfs before import. Create it with a
+# protected SYSTEM + Administrators ACL in one step, reset anything inside that
+# grants other accounts, and refuse to go on unless every item checks out.
+$System = New-Object Security.Principal.SecurityIdentifier 'S-1-5-18'
+$Admins = New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-544'
+$Me     = [Security.Principal.WindowsIdentity]::GetCurrent().User
 
-# ProgramData lets any user create folders, so a user could pre-create ours and
-# swap the rootfs before import. Refuse a folder we do not own, then lock it to
-# SYSTEM and Administrators.
-if (Test-Path $DataDir) {
-  $owner = (Get-Acl $DataDir).GetOwner([Security.Principal.SecurityIdentifier]).Value
-  if ($Trusted -notcontains $owner) {
-    Write-Host "$DataDir exists and is owned by $owner, not an administrator. Remove it and run setup again." -ForegroundColor Red
-    exit 1
+function New-LockedAcl {
+  $acl = New-Object Security.AccessControl.DirectorySecurity
+  $acl.SetAccessRuleProtection($true, $false)
+  $acl.SetOwner($Admins)
+  foreach ($sid in $System, $Admins) {
+    $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+      $sid, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
   }
-} else {
-  New-Item -ItemType Directory $DataDir | Out-Null
+  return $acl
 }
-& icacls.exe $DataDir /setowner '*S-1-5-32-544' /T /C /Q | Out-Null
-& icacls.exe $DataDir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /T /C /Q | Out-Null
-if ($LASTEXITCODE -ne 0) { Write-Host "Could not restrict access to $DataDir" -ForegroundColor Red; exit 1 }
+
+function Test-Trusted([string]$sid, [switch]$Owner) {
+  if ($sid -eq $System.Value -or $sid -eq $Admins.Value) { return $true }
+  if ($Owner) { return $sid -eq $Me.Value }
+  # WSL grants its VM (NT VIRTUAL MACHINE\<id>) and a capability SID access to
+  # ext4.vhdx. Neither is an account a user can log on as.
+  return $sid -like 'S-1-5-83-*' -or $sid -like 'S-1-15-3-*'
+}
+
+function Test-Locked($path) {
+  $acl = Get-Acl -LiteralPath $path
+  if (-not (Test-Trusted $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -Owner)) { return $false }
+  foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+    if (-not (Test-Trusted $rule.IdentityReference.Value)) { return $false }
+  }
+  return $true
+}
+
+function Get-Unlocked {
+  @(Get-Item -LiteralPath $DataDir) + @(Get-ChildItem -LiteralPath $DataDir -Recurse -Force) |
+    Where-Object { -not (Test-Locked $_.FullName) }
+}
+
+try {
+  if (Test-Path $DataDir) {
+    $owner = (Get-Acl $DataDir).GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if (-not (Test-Trusted $owner -Owner)) {
+      throw "$DataDir exists and is owned by $owner, not an administrator. Remove it and run setup again."
+    }
+    Set-Acl -LiteralPath $DataDir -AclObject (New-LockedAcl)
+    # Reset only what fails the check, so WSL's own grants on ext4.vhdx stay.
+    foreach ($item in @(Get-Unlocked)) {
+      & icacls.exe $item.FullName /setowner '*S-1-5-32-544' /C /Q | Out-Null
+      & icacls.exe $item.FullName /reset /C /Q | Out-Null
+    }
+  } else {
+    [IO.Directory]::CreateDirectory($DataDir, (New-LockedAcl)) | Out-Null
+  }
+  $bad = @(Get-Unlocked) | Select-Object -First 1
+  if ($bad) { throw "$($bad.FullName) is open to accounts other than SYSTEM and Administrators." }
+} catch {
+  Write-Host "Setup stopped: $_" -ForegroundColor Red
+  exit 1
+}
 New-Item -ItemType Directory -Force $CacheDir | Out-Null
 Start-Transcript -Path (Join-Path $DataDir 'install.log') -Append | Out-Null
 

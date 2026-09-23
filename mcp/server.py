@@ -209,6 +209,9 @@ def _start_job(job: Job, work: Any) -> dict[str, Any]:
         try:
             job.detail = await work(job) or "done"
             job.state = "done"
+        except asyncio.CancelledError:
+            job.state = "error"
+            job.detail = "cancelled by model_down"
         except Exception as exc:  # reported through job_status
             job.state = "error"
             job.detail = str(exc)[-3000:]
@@ -371,8 +374,10 @@ async def model_up(
 
 @mcp.tool()
 async def model_down() -> dict[str, Any]:
-    """Stop every engine and free the GPU. Refused while a job is running."""
-    _refuse_if_busy()
+    """Stop every engine and free the GPU. Cancels a pull or up job that is still running."""
+    if (job := _busy()) is not None and job.task is not None:
+        job.task.cancel()
+        await asyncio.wait({job.task}, timeout=30)
     await asyncio.to_thread(_stop, *ENGINES)
     return {"stopped": list(ENGINES), "gpu": await asyncio.to_thread(_gpu)}
 
