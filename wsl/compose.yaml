@@ -1,0 +1,54 @@
+# aias stack inside the `aias` WSL distro, installed to /opt/aias.
+# `docker compose up -d` starts only the MCP server. The engines sit in the
+# `engine` profile and are started by the MCP tools, one at a time, because a
+# single consumer GPU cannot hold both.
+name: aias
+
+services:
+  mcp:
+    build: ./mcp
+    image: aias-mcp:local
+    restart: unless-stopped
+    gpus: all
+    ports: ["127.0.0.1:11400:11400"]
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: utility
+      AIAS_COMPOSE: /opt/aias/compose.yaml
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /opt/aias:/opt/aias:ro
+      - hf-cache:/root/.cache/huggingface
+      - ollama:/ollama:ro
+
+  ollama:
+    image: ollama/ollama:0.32.15
+    profiles: [engine]
+    gpus: all
+    ports: ["127.0.0.1:11434:11434"]
+    volumes:
+      - ollama:/root/.ollama
+    environment:
+      OLLAMA_CONTEXT_LENGTH: "32768"
+      OLLAMA_FLASH_ATTENTION: "1"
+      OLLAMA_KV_CACHE_TYPE: q8_0
+
+  vllm:
+    image: vllm/vllm-openai:v0.30.0
+    profiles: [engine]
+    gpus: all
+    ipc: host
+    ports: ["127.0.0.1:8000:8000"]
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+      - vllm-cache:/root/.cache/vllm
+    # The Windows desktop holds about 1 GB of VRAM, so vLLM's 0.92 default
+    # fails at startup on a 10 GB card.
+    command:
+      - --model=${VLLM_MODEL:-Qwen/Qwen3-0.6B}
+      - --max-model-len=${VLLM_MAX_LEN:-8192}
+      - --gpu-memory-utilization=${VLLM_GPU_UTIL:-0.8}
+
+volumes:
+  hf-cache:
+  vllm-cache:
+  ollama:
