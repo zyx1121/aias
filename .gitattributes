@@ -1,0 +1,4 @@
+# Files that run inside Linux must keep LF even when checked out on Windows.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.iss text eol=crlf
