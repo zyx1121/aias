@@ -82,6 +82,9 @@ try {
   Write-Host "Setup stopped: $_" -ForegroundColor Red
   exit 1
 }
+# Start every run with an empty cache: a handle opened on an old file before
+# the ACL was tightened would still be valid.
+if (Test-Path $CacheDir) { Remove-Item -LiteralPath $CacheDir -Recurse -Force }
 New-Item -ItemType Directory -Force $CacheDir | Out-Null
 Start-Transcript -Path (Join-Path $DataDir 'install.log') -Append | Out-Null
 

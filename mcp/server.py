@@ -7,9 +7,11 @@ socket with the same compose file a person would use by hand.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import subprocess
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -50,14 +52,22 @@ mcp = MCPServer(
 # ---------------------------------------------------------------- helpers
 
 
+_NO_LOCK = contextlib.nullcontext()
+# Serializes compose calls that start or stop containers. A cancelled job's
+# `up` keeps running in its worker thread, so a later `stop` must wait for it.
+_COMPOSE_LOCK = threading.Lock()
+
+
 def _run(*args: str, env: dict[str, str] | None = None, timeout: float = 600) -> str:
-    proc = subprocess.run(
-        [*COMPOSE, *args],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        env={**os.environ, **(env or {})},
-    )
+    mutating = args[0] in ("up", "stop")
+    with _COMPOSE_LOCK if mutating else _NO_LOCK:
+        proc = subprocess.run(
+            [*COMPOSE, *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env={**os.environ, **(env or {})},
+        )
     if proc.returncode != 0:
         raise RuntimeError(f"docker compose {' '.join(args)} failed: {proc.stderr.strip()[-2000:]}")
     return proc.stdout
