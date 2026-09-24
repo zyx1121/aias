@@ -451,11 +451,6 @@ async def _sync_single(engine: Engine, running: dict[str, Any]) -> None:
         model = args.get("model")
     else:
         model = await asyncio.to_thread(_nemo_model_from_container)
-    if inst is not None:
-        if inst.model == model:
-            return
-        # The container runs something else than the ledger says: rebuild from it.
-        del INSTANCES[inst.key]
     if not model:
         return
     if engine == "vllm":
@@ -463,9 +458,20 @@ async def _sync_single(engine: Engine, running: dict[str, Any]) -> None:
         util = float(args.get("gpu-memory-utilization", 0) or 0)
         need, source = STORE.measured(key), "measured"
         if not need:
+            if not _total():
+                return  # no card size yet: an estimate would be 0; try next round
+            # aias starts vLLM with util = its budgeted need / card.
             need, source = round(util * _total()), "estimate"
     else:
         need, source, key = await _simple_need("nemo", model, None)
+    if inst is not None:
+        if inst.model == model:
+            if inst.vram_source == "estimate" and (inst.vram_mib, inst.record_key) != (need, key):
+                # An estimate made on stale inputs must not stick.
+                inst.vram_mib, inst.vram_source, inst.record_key = need, source, key
+            return
+        # The container runs something else than the ledger says: rebuild from it.
+        del INSTANCES[inst.key]
     INSTANCES[f"{engine}:{model}"] = Instance(engine, model, need, source, key)
 
 
@@ -502,12 +508,14 @@ async def _reconcile() -> None:
 
 
 async def _reconcile_once() -> None:
+    # The card first: rebuilding a vLLM entry after a restart needs its size.
+    card = await asyncio.to_thread(vram.smi)
+    if card:
+        CARD["smi"] = card
     running = await asyncio.to_thread(_running)
     await _sync_single("vllm", running)
     await _sync_single("nemo", running)
     await _sync_ollama(running)
-    card = await asyncio.to_thread(vram.smi)
-    CARD["smi"] = card
     if card:
         # What nvidia-smi shows beyond the ledger is the desktop and anything
         # aias does not know about. Past the desktop reserve, stop admitting.
@@ -714,6 +722,11 @@ async def _place(job: Job, inst: Instance, evict: str, start: Any) -> str:
             job.result = _refusal(plan)
             raise RuntimeError(plan.reason or f"{inst.model} does not fit")
         evicted = await _carry_out(job, plan)
+        for key in plan.replace:
+            # Tell whoever started the model that was just swapped out.
+            for other in JOBS.values():
+                if other.kind == "up" and other.instance == key and other.state == "done":
+                    other.result = {**(other.result or {}), "replaced_by": inst.model, "replaced_by_job": job.id}
         if evicted:
             await _wait_card_free(inst.vram_mib + vram.SAFETY_MIB)
         quiet = not evicted and not any(

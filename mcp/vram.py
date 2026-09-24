@@ -284,17 +284,23 @@ def make_plan(
     return plan
 
 
+def _staleness(combo: tuple[Candidate, ...]) -> tuple[float, ...]:
+    """Sort key among sets of one size: last use of the newest member first, then
+    the next newest, and so on; smaller (longer idle) wins."""
+    return tuple(sorted((c.last_used for c in combo), reverse=True))
+
+
 def _fewest(by_age: list[Candidate], fits: Any) -> list[Candidate] | None:
-    """The fewest candidates whose eviction makes room; among sets of that size, the
-    one idle the longest. by_age is oldest first, and combinations() walks index
-    tuples in lexicographic order, so the first set that fits is that one."""
+    """The fewest candidates whose eviction makes room. Among sets of that size, the
+    one whose most recently used member was used longest ago (then the next most
+    recent, and so on), so recently used models are the last to go."""
     if not fits(by_age):
         return None
     if len(by_age) <= EXHAUSTIVE_MAX:
         for size in range(1, len(by_age) + 1):
-            for combo in itertools.combinations(by_age, size):
-                if fits(list(combo)):
-                    return list(combo)
+            fitting = [c for c in itertools.combinations(by_age, size) if fits(list(c))]
+            if fitting:
+                return sorted(min(fitting, key=_staleness), key=lambda c: c.last_used)
     # Greedy fallback: oldest first until it fits, then drop what the rest can do without.
     chosen: list[Candidate] = []
     for cand in by_age:

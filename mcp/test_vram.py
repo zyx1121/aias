@@ -50,6 +50,13 @@ class EvictionPlan(unittest.TestCase):
         p = plan(3000, 8704, cands)
         self.assertEqual(p.evict, ["old"])
 
+    def test_tie_goes_to_the_set_whose_newest_is_oldest(self):
+        # By age A (oldest) .. D (newest). Freeing 4000 takes two; (A, D) and (B, C)
+        # both fit, but (A, D) holds the newest model, so (B, C) goes.
+        cands = [Candidate("A", 1000, 1), Candidate("B", 2000, 2), Candidate("C", 2000, 3), Candidate("D", 3000, 4)]
+        p = plan(4000, 8704, cands)
+        self.assertEqual(p.evict, ["B", "C"])
+
     def test_greedy_fallback_past_the_limit(self):
         cands = [Candidate(f"m{i}", 100, i) for i in range(vram.EXHAUSTIVE_MAX + 3)]
         p = plan(1000, 8704, cands)
