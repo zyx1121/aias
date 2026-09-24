@@ -11,7 +11,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: shellcheck wsl/bootstrap.sh
-      - run: python3 -m py_compile mcp/server.py mcp/audio.py nemo/server.py
+      - run: python3 -m py_compile mcp/server.py mcp/audio.py mcp/vram.py nemo/server.py
+      - run: python3 -m unittest discover -s mcp -v
       - run: docker compose -f wsl/compose.yaml config -q
 
   mcp:

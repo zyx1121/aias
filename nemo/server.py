@@ -63,11 +63,19 @@ def _diarize(wav: Path, mode: str) -> dict[str, Any]:
             setattr(model.sortformer_modules, key, value)
         model._check_streaming_parameters()
         torch.cuda.reset_peak_memory_stats()
+        base_reserved = torch.cuda.memory_reserved()
         started = time.monotonic()
-        with torch.inference_mode():
-            segments = model.diarize(audio=[str(wav)], batch_size=1)[0]
-        elapsed = time.monotonic() - started
-        peak_mib = torch.cuda.max_memory_allocated() / 2**20
+        try:
+            with torch.inference_mode():
+                segments = model.diarize(audio=[str(wav)], batch_size=1)[0]
+            elapsed = time.monotonic() - started
+            peak_mib = torch.cuda.max_memory_allocated() / 2**20
+            # What this file added on top of the idle engine, as nvidia-smi sees it.
+            burst_mib = (torch.cuda.max_memory_reserved() - base_reserved) / 2**20
+        finally:
+            # Hand the per-file peak back, so the engine returns to the base
+            # footprint the MCP server budgets it at between jobs.
+            torch.cuda.empty_cache()
 
     lines = []
     seconds: dict[str, float] = defaultdict(float)
@@ -84,6 +92,7 @@ def _diarize(wav: Path, mode: str) -> dict[str, Any]:
         "audio_s": round(duration, 1),
         "elapsed_s": round(elapsed, 2),
         "gpu_peak_mib": round(peak_mib),
+        "burst_mib": round(burst_mib),
         "speakers": [
             {"speaker": s, "seconds": round(seconds[s], 1), "segments": counts[s]} for s in sorted(seconds)
         ],
