@@ -14,6 +14,8 @@ services:
     build: ./mcp
     image: aias-mcp:local
     restart: unless-stopped
+    # tini as PID 1 reaps decoder children that are killed after their parent.
+    init: true
     gpus: all
     ports: ["127.0.0.1:11400:11400"]
     environment:

@@ -8,6 +8,7 @@ see a bounded local file.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ipaddress
 import os
 import signal
@@ -31,6 +32,8 @@ FS_HEADROOM = 5_000_000
 DOWNLOAD_SECS = 600
 DECODE_SECS = 600
 PROBE_SECS = 60
+# How long to wait for a killed decoder to be reaped.
+REAP_SECS = 5
 MAX_REDIRECTS = 5
 # ffmpeg and ffprobe parse untrusted files in a container that holds the Docker
 # socket, so they run as nobody, which cannot open the socket, with no way to
@@ -121,10 +124,48 @@ async def _download(url: str, dest: Path) -> None:
         raise AudioError(f"could not download audio_url: {type(exc).__name__} {exc}".rstrip()) from exc
 
 
+# Only one decode at a time, so killing every process nobody owns after it
+# cannot hit another job's decoder. Decoding takes seconds.
+_DECODE_LOCK = asyncio.Lock()
+
+
+def _nobody_pids() -> list[int]:
+    """Live processes in this container whose real or effective uid is nobody."""
+    pids = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/status") as f:
+                fields = dict(line.split(":", 1) for line in f if ":" in line)
+        except OSError:
+            continue
+        uids = fields.get("Uid", "").split()
+        if fields.get("State", "").strip().startswith("Z"):
+            continue  # already dead, waiting for init to reap it
+        if uids[:2] and NOBODY in {int(u) for u in uids[:2]}:
+            pids.append(int(entry))
+    return pids
+
+
+async def _kill_nobody() -> None:
+    """Kill whatever a decoder left behind (a forked child keeps running after the
+    decoder exits). Repeats until none is left, in case one forks while dying."""
+    for _ in range(20):
+        pids = _nobody_pids()
+        if not pids:
+            return
+        for pid in pids:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(pid, signal.SIGKILL)
+        await asyncio.sleep(0.05)
+
+
 async def _run_decoder(args: list[str], timeout: float) -> tuple[int, str, str]:
     """Run ffmpeg or ffprobe inside SANDBOX. prlimit and setpriv exec rather than
-    fork, so the process is the decoder itself; it is killed when the job is
-    cancelled or the timeout passes, so none is left behind."""
+    fork, so the process is the decoder itself. Call with _DECODE_LOCK held: when
+    it ends, however it ends, every process nobody owns is killed, so neither a
+    timeout, a cancel nor a forked child leaves anything behind."""
     proc = await asyncio.create_subprocess_exec(
         *SANDBOX,
         *args,
@@ -133,12 +174,16 @@ async def _run_decoder(args: list[str], timeout: float) -> tuple[int, str, str]:
         stderr=asyncio.subprocess.PIPE,
     )
     try:
+        # A child that inherited the pipes keeps communicate() waiting after the
+        # decoder exits; the timeout covers that too.
         out, err = await asyncio.wait_for(proc.communicate(), timeout)
-    except BaseException:  # timeout, or the job cancelled by model_down
+    finally:
         if proc.returncode is None:
-            proc.kill()
-            await proc.wait()
-        raise
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+        await _kill_nobody()
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(proc.wait(), REAP_SECS)
     return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
 
 
@@ -175,8 +220,8 @@ async def _probe_seconds(src: Path) -> float | None:
         return None
 
 
-async def _decode(src: Path, wav: Path) -> float:
-    """Decode src to 16 kHz mono s16 WAV at wav and return its length in seconds."""
+async def _decode(src: Path, wav: Path) -> None:
+    """Decode src to 16 kHz mono s16 WAV at wav. Call with _DECODE_LOCK held."""
     limit = f"the limit is {MAX_AUDIO_SECS} seconds"
     probed = await _probe_seconds(src)
     if probed is not None and probed > MAX_AUDIO_SECS:
@@ -196,6 +241,11 @@ async def _decode(src: Path, wav: Path) -> float:
         raise AudioError(f"audio is longer than the {MAX_AUDIO_SECS} second limit")
     if code != 0:
         raise AudioError(f"ffmpeg could not decode the audio: {err.strip()[-500:]}")
+
+
+def _check_wav(wav: Path) -> float:
+    """Length of the decoded WAV, within the limits. Call once nothing running as
+    nobody can reach the file any more."""
     duration = _wav_seconds(wav)
     if duration > MAX_AUDIO_SECS:
         # Decoding stopped at the cap, so the real length is unknown.
@@ -211,10 +261,16 @@ async def fetch_wav(url: str, workdir: Path) -> tuple[Path, float]:
     os.chown(workdir, NOBODY, NOBODY)
     src, wav = workdir / "input", workdir / "audio.wav"
     await _download(url, src)
-    duration = await _decode(src, wav)
-    # Take the directory back so nothing running as nobody can swap the WAV
-    # between this check and the engine reading it.
-    os.chown(workdir, 0, 0)
-    os.chmod(workdir, 0o700)
+    async with _DECODE_LOCK:
+        try:
+            await _decode(src, wav)
+        finally:
+            # Nothing of the decoder's may outlive it, and the directory goes back
+            # to root before the WAV is checked, so the checked file is the one
+            # the engine reads.
+            await _kill_nobody()
+            os.chown(workdir, 0, 0)
+            os.chmod(workdir, 0o700)
+    duration = _check_wav(wav)
     src.unlink(missing_ok=True)
     return wav, duration
