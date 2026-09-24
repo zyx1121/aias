@@ -13,7 +13,7 @@
 
 [![CI](https://github.com/zyx1121/aias/actions/workflows/ci.yml/badge.svg)](https://github.com/zyx1121/aias/actions) &nbsp;[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](#license)
 
-Running a local model on Windows used to mean an afternoon of WSL networking, Docker setup and GPU flags, then remembering all of it next time. aias does that setup once, keeps it running, and hands the controls to your agent over MCP. You ask for a model; the agent pulls it, loads it, and gives you an OpenAI compatible URL. It can also tell who spoke when in a recording, with NVIDIA's Nemotron 3 Diarization.
+Running a local model on Windows used to mean an afternoon of WSL networking, Docker setup and GPU flags, then remembering all of it next time. aias does that setup once, keeps it running, and hands the controls to your agent over MCP. You ask for a model; the agent pulls it, loads it, and gives you an OpenAI compatible URL. It can also transcribe a recording with Whisper and tell who spoke when with NVIDIA's Nemotron 3 Diarization.
 
 ```
 > "load Qwen3 0.6B on vLLM and tell me when it answers"
@@ -26,6 +26,7 @@ Running a local model on Windows used to mean an afternoon of WSL networking, Do
 
 - **Installs** WSL, Docker, the NVIDIA container toolkit, Ollama and vLLM into one dedicated WSL distro
 - **Diarizes** audio from a URL into RTTM with a NeMo engine, built the first time you load it
+- **Transcribes** audio from a URL into timestamped segments with Whisper on vLLM
 - **Serves** an MCP server on `http://127.0.0.1:11400/mcp` that starts with Windows
 - **Removes** all of it from Settings > Apps, including images and models
 
@@ -59,10 +60,11 @@ Any other MCP client:
 | `status` | The engine and model that are up, their base URL, GPU memory, running jobs |
 | `model_list` | Models already on disk, per engine, with size |
 | `model_pull` | Download an Ollama model (`qwen3:8b`) or a Hugging Face repo for vLLM (`Qwen/Qwen3-0.6B`) or nemo (`nvidia/Nemotron-3-Diarization`); returns a job |
-| `model_up` | Load a model and stop any other engine; returns a job |
+| `model_up` | Load a model and stop any other engine; picks Whisper's memory settings by itself; returns a job |
 | `model_down` | Stop every engine and free the GPU; cancels a running job |
 | `diarize` | Label who spoke when in an audio URL, up to 8 speakers; needs nemo up; returns a job |
-| `job_status` | Progress of a pull, up or diarize job; waits up to 120 s for it to finish; a done diarize job carries the RTTM |
+| `transcribe` | Speech to text with segment timestamps from an audio URL; needs Whisper up on vLLM; returns a job |
+| `job_status` | Progress of a pull, up, diarize or transcribe job; waits up to 120 s for it to finish; a done diarize or transcribe job carries its output |
 | `logs` | Recent log lines of an engine |
 
 ## Examples
@@ -73,18 +75,21 @@ Any other MCP client:
 | "Get qwen3:8b and load it" | `model_pull { engine: "ollama", model: "qwen3:8b" }`, then `model_up` |
 | "Free the GPU" | `model_down {}` |
 | "Who speaks when in this recording?" | `model_up { engine: "nemo", model: "nvidia/Nemotron-3-Diarization" }`, then `diarize { audio_url: "https://..." }` |
+| "Transcribe this recording" | `model_up { engine: "vllm", model: "openai/whisper-large-v3" }`, then `transcribe { audio_url: "https://..." }` |
+
+## Audio input
+
+`diarize` and `transcribe` take an `audio_url`. The MCP server downloads it, decodes it to 16 kHz mono, and only then hands it to the engine. Limits:
+
+- http or https, any format ffmpeg reads, up to 2 GB and 10 minutes of download
+- up to 2 hours of audio, so offline diarization fits in 10 GB of GPU memory
+- the host, and every redirect, must resolve to a public address: private, loopback and link-local addresses are refused
 
 ## Diarization
 
 The nemo engine runs [nvidia/Nemotron-3-Diarization](https://huggingface.co/nvidia/Nemotron-3-Diarization), a 100M parameter streaming Sortformer that labels up to 8 speakers, overlaps included. The first `model_up` with `engine: "nemo"` builds its image (about 11 GB, 5 minutes); later starts reuse the build cache and take about 30 s, and an upgrade that changed the engine rebuilds it. nemo loads only Hugging Face repos under `nvidia/`, because a `.nemo` archive can carry code.
 
-`diarize` downloads `audio_url` on the server, resamples it to 16 kHz mono, and returns a job. Limits:
-
-- http or https, any format ffmpeg reads, up to 2 GB and 10 minutes of download
-- up to 2 hours of audio, so offline mode fits in 10 GB of GPU memory
-- the host, and every redirect, must resolve to a public address: private, loopback and link-local addresses are refused
-
-The finished job's `result` holds:
+`diarize` returns a job. The finished job's `result` holds:
 
 | Field | Meaning |
 |-------|---------|
@@ -103,9 +108,23 @@ The finished job's `result` holds:
 
 Peak GPU memory in offline mode grows with length: 0.75 GB for 10 minutes, 3.5 GB for 87 minutes (11 s to process).
 
+## Speech to text
+
+`transcribe` runs a Whisper model on the vllm engine; [openai/whisper-large-v3](https://huggingface.co/openai/whisper-large-v3) is the one tested. `model_up` notices a Whisper model and uses `max_model_len` 448 (Whisper's decoder limit) and `gpu_memory_utilization` 0.4 unless you pass them: that is about 4.2 GB, and 0.37 fails to start. It takes about 100 s to load.
+
+| Argument | Meaning |
+|----------|---------|
+| `audio_url` | The recording; see [Audio input](#audio-input) |
+| `language` | ISO 639-1 code, `zh` by default |
+| `traditional` | Convert simplified Chinese characters to traditional (OpenCC `s2tw`), on by default |
+
+Whisper drifts from traditional to simplified Chinese after about 30 seconds, hence `traditional`. It converts characters only; it does not swap words such as 軟件 for 軟體, so the text stays what was said.
+
+vLLM splits long audio into clips of up to 30 s by itself. The finished job's `result` holds `text` (the whole transcript), `segments` (each with `start`, `end` in seconds and `text`), `audio_s` and `elapsed_s`.
+
 ## How it works
 
-Setup imports Ubuntu 24.04 as a WSL distro named `aias` under `C:\ProgramData\aias`, and a scheduled task keeps it running from boot. Inside it, Docker Compose runs the MCP server permanently and starts Ollama, vLLM or nemo on demand, one at a time. Every port is published on 127.0.0.1 only, and the MCP server rejects requests whose Host header is not local, so nothing is reachable from the network.
+Setup imports Ubuntu 24.04 as a WSL distro named `aias` under `C:\ProgramData\aias`, and a scheduled task keeps it running from boot. Inside it, Docker Compose runs the MCP server permanently and starts Ollama, vLLM or nemo on demand, one at a time. The MCP server fetches and decodes audio itself, so the engines never see a URL. Every port is published on 127.0.0.1 only, and the MCP server rejects requests whose Host header is not local, so nothing is reachable from the network.
 
 | Endpoint | Serves |
 |----------|--------|
@@ -118,8 +137,9 @@ nemo has no port of its own: only the MCP server talks to it.
 ## Limitations
 
 - NVIDIA only: vLLM and the container toolkit need CUDA.
-- One model at a time: a consumer GPU cannot hold two. The diarization model counts as one.
-- `diarize` takes a public URL, not a local file or a LAN address: upload the recording somewhere reachable from the internet first.
+- One model at a time: a consumer GPU cannot hold two. The diarization model and Whisper each count as one, so transcribing and diarizing the same recording means two model_up calls.
+- `diarize` and `transcribe` take a public URL, not a local file or a LAN address: upload the recording somewhere reachable from the internet first.
+- `transcribe` has no speaker labels; match its segments against a `diarize` RTTM by time.
 - Docker must not run in another WSL distro at the same time, because all WSL2 distros share one network namespace. Setup checks and stops if it does.
 - Unsigned installer: Windows SmartScreen asks before it runs.
 

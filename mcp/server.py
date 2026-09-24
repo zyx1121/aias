@@ -1,4 +1,5 @@
-"""aias MCP server: pull, start and stop local models on one GPU, and diarize audio.
+"""aias MCP server: pull, start and stop local models on one GPU, and diarize or
+transcribe audio.
 
 Runs in a container next to the engines and drives them through the Docker
 socket with the same compose file a person would use by hand.
@@ -12,6 +13,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -20,12 +22,15 @@ from pathlib import Path
 from typing import Any, Literal
 
 import httpx
+import opencc
 from huggingface_hub import HfApi, scan_cache_dir, snapshot_download
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+
+from audio import AudioError, fetch_wav
 
 Engine = Literal["ollama", "vllm", "nemo"]
 ENGINES: tuple[Engine, ...] = ("ollama", "vllm", "nemo")
@@ -44,21 +49,31 @@ NEMO_BUILD_SECS = 3600
 # nemo loads .nemo archives, which can carry pickled code: only NVIDIA's repos.
 # One path segment under nvidia/, so `nvidia/../other/repo` cannot slip through.
 NEMO_REPO = re.compile(r"nvidia/(?!\.+$)[A-Za-z0-9_.-]+")
-# One diarize call end to end: the engine caps the download at 10 minutes and
-# the audio at 2 hours, which ultralow mode needs about 25 minutes for.
-DIARIZE_SECS = 3600
+# One diarize or transcribe call end to end: audio.py caps the download at
+# 10 minutes and the audio at 2 hours, which ultralow diarization needs about
+# 25 minutes for.
+AUDIO_JOB_SECS = 3600
+# model_up defaults for vllm. Whisper's decoder takes 448 tokens and the model
+# needs about 4.2 GB, so it gets its own budget; 0.37 of 10 GB fails to start.
+VLLM_DEFAULTS = {"max_model_len": 8192, "gpu_memory_utilization": 0.8}
+WHISPER_DEFAULTS = {"max_model_len": 448, "gpu_memory_utilization": 0.4}
+# Whisper drifts from traditional to simplified Chinese after about 30 s.
+# s2tw converts characters only; s2twp would also swap mainland vocabulary for
+# Taiwanese words, which rewrites what the speaker said.
+_S2TW = opencc.OpenCC("s2tw")
 
 mcp = MCPServer(
     "aias",
     instructions=(
         "Local model host on one NVIDIA GPU. Three engines: ollama (names like qwen3:8b), "
-        "vllm (Hugging Face ids like Qwen/Qwen3-0.6B) and nemo, speaker diarization "
-        "(nvidia/Nemotron-3-Diarization). Only one model is up at a time; "
-        "model_up stops whatever else is running. Pulls, startups and diarize runs are jobs, "
-        "one at a time: poll job_status until it finishes before starting the next. "
-        "Once an ollama or vllm model is up, call it through the OpenAI compatible base_url "
-        "that status returns. Once nemo is up, call diarize with an audio URL; the finished "
-        "job carries the RTTM and seconds per speaker."
+        "vllm (Hugging Face ids like Qwen/Qwen3-0.6B, or openai/whisper-large-v3 for speech "
+        "to text) and nemo, speaker diarization (nvidia/Nemotron-3-Diarization). Only one "
+        "model is up at a time; model_up stops whatever else is running. Pulls, startups, "
+        "diarize and transcribe runs are jobs, one at a time: poll job_status until it "
+        "finishes before starting the next. Once an ollama or vllm model is up, call it "
+        "through the OpenAI compatible base_url that status returns. Once nemo is up, call "
+        "diarize with an audio URL; once a whisper model is up on vllm, call transcribe. "
+        "The finished job carries the output in result."
     ),
 )
 
@@ -412,27 +427,96 @@ async def _up_nemo(job: Job) -> str:
     raise RuntimeError(f"nemo did not become ready. Last log lines:\n{tail}")
 
 
-async def _diarize(job: Job, audio_url: str, mode: str) -> str:
-    job.detail = f"downloading and diarizing ({mode})"
+def _is_whisper(model: str | None) -> bool:
+    return model is not None and "whisper" in model.lower()
+
+
+async def _audio_job(job: Job, audio_url: str, engine: str, send: Any) -> dict[str, Any]:
+    """Fetch audio_url as 16 kHz mono WAV (audio.py enforces every limit), then hand
+    it to send(client, wav, audio_s), which calls the engine and returns its reply."""
     try:
-        async with asyncio.timeout(DIARIZE_SECS):
-            async with httpx.AsyncClient(timeout=httpx.Timeout(DIARIZE_SECS, connect=10)) as client:
-                resp = await client.post(
-                    f"{INTERNAL['nemo']}/diarize", json={"audio_url": audio_url, "mode": mode}
-                )
+        async with asyncio.timeout(AUDIO_JOB_SECS):
+            with tempfile.TemporaryDirectory() as tmp:
+                job.detail = "downloading and decoding the audio"
+                wav, audio_s = await fetch_wav(audio_url, Path(tmp))
+                job.detail = f"processing {audio_s / 60:.0f} min of audio"
+                async with httpx.AsyncClient(timeout=httpx.Timeout(AUDIO_JOB_SECS, connect=10)) as client:
+                    resp = await send(client, wav, audio_s)
+    except AudioError as exc:
+        raise RuntimeError(str(exc)) from None
     except TimeoutError:
-        raise RuntimeError(f"diarize did not finish within {DIARIZE_SECS} s") from None
+        raise RuntimeError(f"{job.kind} did not finish within {AUDIO_JOB_SECS} s") from None
     except httpx.HTTPError as exc:
-        raise RuntimeError(f"could not reach the nemo engine: {type(exc).__name__} {exc}".rstrip()) from exc
+        raise RuntimeError(f"could not reach the {engine} engine: {type(exc).__name__} {exc}".rstrip()) from exc
     try:
         body = resp.json()
     except ValueError:
         body = {"error": resp.text[-1000:]}
     if resp.status_code != 200:
-        raise RuntimeError(body.get("error") or f"nemo answered HTTP {resp.status_code}")
+        err = body.get("error")
+        if isinstance(err, dict):  # vLLM wraps errors as {"error": {"message": ...}}
+            err = err.get("message")
+        raise RuntimeError(err or f"{engine} answered HTTP {resp.status_code}")
+    return body
+
+
+async def _wav_chunks(wav: Path) -> Any:
+    with wav.open("rb") as f:
+        while chunk := await asyncio.to_thread(f.read, 1 << 20):
+            yield chunk
+
+
+async def _diarize(job: Job, audio_url: str, mode: str) -> str:
+    async def send(client: httpx.AsyncClient, wav: Path, _: float) -> httpx.Response:
+        return await client.post(
+            f"{INTERNAL['nemo']}/diarize",
+            params={"mode": mode},
+            content=_wav_chunks(wav),
+            headers={"Content-Type": "audio/wav"},
+        )
+
+    body = await _audio_job(job, audio_url, "nemo", send)
     job.result = body
     speakers = ", ".join(f"{s['speaker']} {s['seconds']:.0f} s" for s in body["speakers"]) or "no speech"
     return f"{len(body['speakers'])} speakers in {body['audio_s']:.0f} s of audio: {speakers}"
+
+
+async def _transcribe(job: Job, audio_url: str, language: str, traditional: bool) -> str:
+    timing: dict[str, float] = {}
+
+    async def send(client: httpx.AsyncClient, wav: Path, audio_s: float) -> httpx.Response:
+        timing["audio_s"] = audio_s
+        started = time.monotonic()
+        with wav.open("rb") as f:
+            resp = await client.post(
+                f"{INTERNAL['vllm']}/v1/audio/transcriptions",
+                data={
+                    "model": job.model,
+                    "language": language,
+                    "response_format": "verbose_json",
+                    "temperature": "0",
+                },
+                files={"file": ("audio.wav", f, "audio/wav")},
+            )
+        timing["elapsed_s"] = time.monotonic() - started
+        return resp
+
+    body = await _audio_job(job, audio_url, "vllm", send)
+    convert = _S2TW.convert if traditional else (lambda text: text)
+    segments = [
+        {"start": round(seg["start"], 2), "end": round(seg["end"], 2), "text": convert(seg["text"].strip())}
+        for seg in body.get("segments") or []
+    ]
+    job.result = {
+        "model": job.model,
+        "language": language,
+        "traditional": traditional,
+        "audio_s": round(timing["audio_s"], 1),
+        "elapsed_s": round(timing["elapsed_s"], 2),
+        "text": convert(body.get("text", "").strip()),
+        "segments": segments,
+    }
+    return f"{len(segments)} segments from {timing['audio_s']:.0f} s of audio in {timing['elapsed_s']:.0f} s"
 
 
 # ---------------------------------------------------------------- tools
@@ -505,12 +589,13 @@ async def model_pull(engine: Engine, model: str) -> dict[str, Any]:
 async def model_up(
     engine: Engine,
     model: str,
-    max_model_len: int = 8192,
-    gpu_memory_utilization: float = 0.8,
+    max_model_len: int | None = None,
+    gpu_memory_utilization: float | None = None,
 ) -> dict[str, Any]:
     """Load a model so it serves requests, stopping any other engine first. The two
-    tuning arguments apply to vllm only. vLLM startup takes 40 s to several minutes; the
-    first nemo start builds its image and takes about 5 minutes.
+    tuning arguments apply to vllm only; left out, they are 8192 and 0.8, or 448 and 0.4
+    for a Whisper model. vLLM startup takes 40 s to several minutes; the first nemo start
+    builds its image and takes about 5 minutes.
     Returns a job; when it is done, status shows the base_url (nemo has none: use diarize)."""
     job = Job("up", engine, model)
     if engine == "ollama":
@@ -518,12 +603,16 @@ async def model_up(
     if engine == "nemo":
         _check_nemo_repo(model)
         return _start_job(job, _up_nemo)
-    return _start_job(job, lambda j: _up_vllm(j, max_model_len, gpu_memory_utilization))
+    defaults = WHISPER_DEFAULTS if _is_whisper(model) else VLLM_DEFAULTS
+    max_len = max_model_len or defaults["max_model_len"]
+    util = gpu_memory_utilization or defaults["gpu_memory_utilization"]
+    return _start_job(job, lambda j: _up_vllm(j, max_len, util))
 
 
 @mcp.tool()
 async def model_down() -> dict[str, Any]:
-    """Stop every engine and free the GPU. Cancels a pull, up or diarize job that is still running."""
+    """Stop every engine and free the GPU. Cancels a pull, up, diarize or transcribe job that
+    is still running."""
     if (job := _busy()) is not None and job.task is not None:
         job.task.cancel()
         # A build holds the compose lock for minutes; end it so _stop gets the lock.
@@ -549,9 +638,30 @@ async def diarize(audio_url: str, mode: Mode = "offline") -> dict[str, Any]:
 
 
 @mcp.tool()
+async def transcribe(audio_url: str, language: str = "zh", traditional: bool = True) -> dict[str, Any]:
+    """Speech to text with timestamps, with a Whisper model on vllm (model_up engine=vllm
+    model=openai/whisper-large-v3 first). audio_url is an http(s) link the server
+    downloads; any format ffmpeg reads, up to 2 GB and 2 hours. language is an ISO 639-1
+    code. traditional converts simplified Chinese characters to traditional (Taiwan),
+    because Whisper drifts to simplified. Returns a job; when it is done, job_status
+    carries result with the full text and segments (start, end, text) in seconds."""
+    running = await asyncio.to_thread(_running)
+    model = await asyncio.to_thread(_vllm_model_from_container) if "vllm" in running else None
+    if not _is_whisper(model):
+        raise ToolError(
+            "no Whisper model is up: run model_up engine=vllm model=openai/whisper-large-v3 first"
+        )
+    if not await _wait_http(f"{INTERNAL['vllm']}/v1/models", 0.1):
+        raise ToolError(f"{model} is still starting; wait for its model_up job to finish")
+    return _start_job(
+        Job("transcribe", "vllm", model), lambda j: _transcribe(j, audio_url, language, traditional)
+    )
+
+
+@mcp.tool()
 async def job_status(job_id: str, wait_seconds: int = 30) -> dict[str, Any]:
-    """Progress of a pull, up or diarize job. Blocks up to wait_seconds (max 120) for it to
-    finish. A finished diarize job carries its output in result."""
+    """Progress of a pull, up, diarize or transcribe job. Blocks up to wait_seconds (max 120)
+    for it to finish. A finished diarize or transcribe job carries its output in result."""
     job = JOBS.get(job_id)
     if job is None:
         raise ToolError(f"no job {job_id}; jobs do not survive a server restart")

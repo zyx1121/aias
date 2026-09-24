@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: shellcheck wsl/bootstrap.sh
-      - run: python3 -m py_compile mcp/server.py nemo/server.py
+      - run: python3 -m py_compile mcp/server.py mcp/audio.py nemo/server.py
       - run: docker compose -f wsl/compose.yaml config -q
 
   mcp:
@@ -27,7 +27,7 @@ jobs:
             -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
             -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq -r '.result.tools[].name' | sort | tr '\n' ' ')
           echo "tools: $tools"
-          test "$tools" = "diarize job_status logs model_down model_list model_pull model_up status "
+          test "$tools" = "diarize job_status logs model_down model_list model_pull model_up status transcribe "
       - name: Foreign Host header is refused
         run: |
           code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:11400/mcp -H 'Host: evil.example' \

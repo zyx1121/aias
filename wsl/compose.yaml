@@ -41,6 +41,13 @@ services:
     volumes:
       - hf-cache:/root/.cache/huggingface
       - vllm-cache:/root/.cache/vllm
+    # Speech to text: the MCP server sends up to 2 hours of 16 kHz mono WAV
+    # (230 MB, 461 MB as float32 once decoded), and vLLM splits it into
+    # 30 s clips itself. The defaults stop at 25 MB and 10 minutes.
+    environment:
+      VLLM_MAX_AUDIO_CLIP_FILESIZE_MB: "256"
+      VLLM_MAX_AUDIO_DECODE_DURATION_S: "7200"
+      VLLM_MAX_AUDIO_DECODE_BYTES: "536870912"
     # The Windows desktop holds about 1 GB of VRAM, so vLLM's 0.92 default
     # fails at startup on a 10 GB card.
     command:
