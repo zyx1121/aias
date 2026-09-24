@@ -397,6 +397,13 @@ STORE = vram.Store()
 # admissions never plan against the same free memory.
 PLACEMENT = asyncio.Lock()
 QUEUES: dict[str, asyncio.Semaphore] = {}
+# Bumped whenever GPU memory is claimed or released (a start, an eviction, a
+# burst), so a start can tell whether its before/after measurement is its own.
+_EPOCH = [0]
+
+
+def _touch() -> None:
+    _EPOCH[0] += 1
 CARD: dict[str, Any] = {"smi": None, "pressure": False, "unaccounted_mib": 0}
 
 
@@ -568,12 +575,29 @@ async def _reconcile() -> None:
         await _reconcile_once()
 
 
+LEGACY_VLLM = "aias-vllm-1"  # the compose vllm service container of aias before 0.2
+
+
+def _is_legacy_vllm() -> bool:
+    """aias-vllm-1 exists and is not one of ours (no aias labels)."""
+    out = subprocess.run(["docker", "inspect", "-f", "{{json .Config.Labels}}", LEGACY_VLLM],
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        return False
+    return f"{LABEL}.engine" not in (json.loads(out.stdout or "{}") or {})
+
+
 async def _reconcile_once() -> None:
     # The card first: rebuilding a vLLM entry after a restart needs its size.
     card = await asyncio.to_thread(vram.smi)
     if card:
         CARD["smi"] = card
     running = await asyncio.to_thread(_running)
+    if "vllm" in running and await asyncio.to_thread(_is_legacy_vllm):
+        # Started from the compose file by hand or by an old aias: it holds port
+        # 8000 and GPU memory outside the ledger.
+        log.warning("stopping %s, the old single vLLM container", LEGACY_VLLM)
+        await asyncio.to_thread(_stop, "vllm")
     await _sync_vllm()
     await _sync_single("nemo", running)
     await _sync_ollama(running)
@@ -694,6 +718,7 @@ async def _evict(key: str) -> None:
         await asyncio.to_thread(_stop, inst.engine)
     INSTANCES.pop(key, None)
     STORE.pin(key, False)
+    _touch()
 
 
 async def _wait_card_free(mib: int, secs: float = 30) -> None:
@@ -763,7 +788,8 @@ def _start_job(job: Job, work: Any) -> dict[str, Any]:
             job.detail = (str(exc) or type(exc).__name__)[-3000:]
         finally:
             job.finished = time.time()
-            BURSTS.pop(job.id, None)
+            if BURSTS.pop(job.id, None) is not None:
+                _touch()
             if job.kind != "up":
                 for key in (job.instance, *job.also):
                     if key in INSTANCES:
@@ -791,9 +817,11 @@ def _replacements(engine: Engine, key: str) -> list[str]:
 
 async def _place(job: Job, inst: Instance, evict: str, start: Any) -> str:
     """Admit inst against the budget, evicting as the plan says if allowed, then
-    start it. Holds PLACEMENT throughout: what to replace or evict is decided on
-    the ledger as it is now, and the footprint measured around the start is this
-    model's alone (it is not measured when anything was stopped for it)."""
+    start it. PLACEMENT is held only to decide: what to replace or evict comes from
+    the ledger as it is now, and the model is booked (a placeholder, not ready)
+    before the lock is released, so the minutes a start takes do not hold up other
+    admissions. A failed or cancelled start takes its booking back. The footprint
+    is measured only when nothing else claimed or released memory meanwhile."""
     async with PLACEMENT:
         job.detail = "waiting for room on the GPU"
         await _reconcile()
@@ -814,30 +842,41 @@ async def _place(job: Job, inst: Instance, evict: str, start: Any) -> str:
                     other.result = {**(other.result or {}), "replaced_by": inst.model, "replaced_by_job": job.id}
         if evicted:
             await _wait_card_free(inst.vram_mib + vram.SAFETY_MIB)
+        if inst.engine == "vllm":
+            inst.port = await asyncio.to_thread(_free_vllm_port)
         quiet = not evicted and not any(
             j.state == "running" and j is not job and j.kind != "pull" for j in JOBS.values()
         )
         before = await asyncio.to_thread(vram.smi)
         inst.starting = True
+        inst.since = time.time()
         INSTANCES[inst.key] = inst
-        try:
-            detail = await start(job, inst)
-        except BaseException:
+        _touch()
+        epoch = _EPOCH[0]
+
+    try:
+        detail = await start(job, inst)
+    except BaseException:
+        async with PLACEMENT:
             if INSTANCES.get(inst.key) is inst:
                 del INSTANCES[inst.key]
-            raise
-        inst.starting = False
-        inst.last_used = inst.since = time.time()
-        if quiet and inst.engine != "ollama" and before:
-            await asyncio.sleep(3)
-            after = await asyncio.to_thread(vram.smi)
-            if after and after["used"] > before["used"]:
-                measured = after["used"] - before["used"]
-                STORE.record(inst.record_key, measured)
-                if inst.vram_source != "declared":  # a declaration stays in charge
-                    inst.vram_mib, inst.vram_source = measured, "measured"
-        job.result = {"evicted": evicted, "vram_mib": inst.vram_mib, "vram_source": inst.vram_source}
-        return detail
+                _touch()
+        raise
+    inst.starting = False
+    inst.last_used = inst.since = time.time()
+    others_busy = any(j.state == "running" and j is not job and j.kind != "pull" for j in JOBS.values())
+    if quiet and not others_busy and _EPOCH[0] == epoch and inst.engine != "ollama" and before:
+        await asyncio.sleep(3)
+        after = await asyncio.to_thread(vram.smi)
+        if _EPOCH[0] == epoch and after and after["used"] > before["used"]:
+            measured = after["used"] - before["used"]
+            STORE.record(inst.record_key, measured)
+            if inst.vram_source != "declared":  # a declaration stays in charge
+                inst.vram_mib, inst.vram_source = measured, "measured"
+    job.result = {"evicted": evicted, "vram_mib": inst.vram_mib, "vram_source": inst.vram_source}
+    if inst.engine == "vllm":
+        job.result["port"] = inst.port
+    return detail
 
 
 async def _ensure_ollama_server() -> bool:
@@ -917,14 +956,15 @@ async def _start_ollama(job: Job, inst: Instance) -> str:
     return f"{inst.model} is up at {PUBLIC['ollama']}"
 
 
-def _free_vllm_port() -> int:
-    """Lowest port no running vLLM container holds. A stopped container still on it
-    is removed first (its name is taken by the port)."""
+def _free_vllm_port(skip: set[int] | frozenset[int] = frozenset()) -> int:
+    """Lowest port no running vLLM container or booked model holds (and not in
+    skip). A stopped container still on it is removed first (its name is taken by
+    the port)."""
     rows = _vllm_containers()
     busy = {int(r["labels"].get("port", -1)) for r in rows if r["running"]}
     busy |= {i.port for i in INSTANCES.values() if i.engine == "vllm" and i.port}
     for port in VLLM_PORTS:
-        if port not in busy:
+        if port not in busy and port not in skip:
             _remove_vllm([r["name"] for r in rows if r["name"] == _vllm_name(port)])
             return port
     raise RuntimeError(f"all {len(VLLM_PORTS)} vLLM ports ({VLLM_PORTS[0]}-{VLLM_PORTS[-1]}) are in use")
@@ -937,20 +977,33 @@ def _start_vllm(cfg: dict[str, Any]) -> Any:
         # everything else uses); with --kv-cache-memory that check is all util still
         # does, so ask for exactly the budgeted need.
         util = min(0.95, math.ceil(inst.vram_mib / total * 1000) / 1000)
-        port = await asyncio.to_thread(_free_vllm_port)
-        inst.port = port
-        labels = {
-            "engine": "vllm", "model": inst.model, "port": str(port), "vram_mib": str(inst.vram_mib),
-            "vram_source": inst.vram_source, "record_key": inst.record_key,
-        }
-        args = [
-            "run", "-d", "--no-deps", "--name", _vllm_name(port), "-p", f"127.0.0.1:{port}:8000",
-            *[a for k, v in labels.items() for a in ("--label", f"{LABEL}.{k}={v}")],
-            "vllm",
-            f"--model={inst.model}", f"--max-model-len={cfg['max_len']}",
-            f"--gpu-memory-utilization={util}", f"--kv-cache-memory={cfg['kv']}",
-        ]
-        await asyncio.to_thread(_run, *args)
+        tried: set[int] = set()
+        while True:
+            port = inst.port  # booked by _place, or the next one after a clash
+            labels = {
+                "engine": "vllm", "model": inst.model, "port": str(port), "vram_mib": str(inst.vram_mib),
+                "vram_source": inst.vram_source, "record_key": inst.record_key,
+            }
+            args = [
+                "run", "-d", "--no-deps", "--name", _vllm_name(port), "-p", f"127.0.0.1:{port}:8000",
+                *[a for k, v in labels.items() for a in ("--label", f"{LABEL}.{k}={v}")],
+                "vllm",
+                f"--model={inst.model}", f"--max-model-len={cfg['max_len']}",
+                f"--gpu-memory-utilization={util}", f"--kv-cache-memory={cfg['kv']}",
+            ]
+            try:
+                await asyncio.to_thread(_run, *args)
+                break
+            except RuntimeError as exc:
+                text = str(exc).lower()
+                if "port is already allocated" not in text and "address already in use" not in text:
+                    raise
+                # Something outside aias holds the port: drop the half-made
+                # container and take the next free one.
+                await asyncio.to_thread(_remove_vllm, [_vllm_name(port)])
+                tried.add(port)
+                async with PLACEMENT:
+                    inst.port = await asyncio.to_thread(_free_vllm_port, tried)
         job.detail = f"starting on port {port} (weights, compile, warmup)"
 
         def alive() -> bool:
@@ -1037,6 +1090,7 @@ async def _reserve_burst(job: Job, mib: int, evict: str, protect: set[str]) -> N
             raise RuntimeError((plan.reason or f"the {mib} MiB this job needs does not fit") + limit)
         await _carry_out(job, plan)
         BURSTS[job.id] = mib
+        _touch()
 
 
 async def _run_nemo(job: Job, client: httpx.AsyncClient, wav: Path, audio_s: float,
@@ -1055,7 +1109,8 @@ async def _run_nemo(job: Job, client: httpx.AsyncClient, wav: Path, audio_s: flo
                 headers={"Content-Type": "audio/wav"},
             )
         finally:
-            BURSTS.pop(job.id, None)
+            if BURSTS.pop(job.id, None) is not None:
+                _touch()
     body = _reply(resp, "nemo")
     if body.get("burst_mib") and body.get("audio_s"):
         STORE.record_burst(model, body["burst_mib"], body["audio_s"])
@@ -1419,12 +1474,15 @@ async def model_down(model: str | None = None) -> dict[str, Any]:
         async with _RECONCILE_LOCK:
             await asyncio.to_thread(_stop, *ENGINES)
             await asyncio.to_thread(lambda: _remove_vllm([r["name"] for r in _vllm_containers()]))
+            if await asyncio.to_thread(_is_legacy_vllm):
+                await asyncio.to_thread(_remove_vllm, [LEGACY_VLLM])
             for inst in list(INSTANCES.values()):
                 STORE.pin(inst.key, False)
                 if inst.engine == "ollama":
                     STORE.manage(inst.model, False)
             INSTANCES.clear()
             BURSTS.clear()
+            _touch()
             CARD["smi"] = await asyncio.to_thread(vram.smi)
         return {"stopped": list(ENGINES), "gpu": _gpu_view()}
 
@@ -1449,6 +1507,7 @@ async def model_down(model: str | None = None) -> dict[str, Any]:
             await _unload_ollama(name)
             STORE.manage(name, False)
             stopped.append(f"ollama:{name}")
+        _touch()
         for inst in [i for i in INSTANCES.values() if i.model in names]:
             INSTANCES.pop(inst.key, None)
             STORE.pin(inst.key, False)
@@ -1501,9 +1560,11 @@ async def transcribe(
     traditional: bool = True,
     diarize: bool = False,
     evict: Evict = "never",
+    model: str | None = None,
 ) -> dict[str, Any]:
     """Speech to text with timestamps, with a Whisper model on vllm (model_up engine=vllm
-    model=openai/whisper-large-v3 first). audio_url is an http(s) link the server
+    model=openai/whisper-large-v3 first). model picks one of several Whisper models
+    that are up; left out, the one used most recently; the result names it. audio_url is an http(s) link the server
     downloads; any format ffmpeg reads, up to 2 GB and 2 hours. language is an ISO 639-1
     code; a tag like zh-TW or zh_CN is cut to zh. traditional converts simplified Chinese
     characters to traditional (Taiwan), because Whisper drifts to simplified; it applies
@@ -1516,7 +1577,14 @@ async def transcribe(
     text and segments (start, end, text) in seconds."""
     _ensure_reconciler()
     await _reconcile()
-    inst = _up_instance("vllm", _is_whisper)
+    whispers = [i for i in INSTANCES.values() if i.engine == "vllm" and _is_whisper(i.model) and not i.starting]
+    if model is not None:
+        if not _is_whisper(model):
+            raise ToolError(f"{model} is not a Whisper model")
+        whispers = [i for i in whispers if i.model == model]
+        if not whispers:
+            raise ToolError(f"{model} is not up: run model_up engine=vllm model={model} first")
+    inst = max(whispers, key=lambda i: i.last_used, default=None)
     nemo = _up_instance("nemo", lambda m: True) if diarize else None
     missing = []
     if inst is None:

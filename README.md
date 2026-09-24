@@ -99,7 +99,7 @@ The ledger decides, not nvidia-smi: under WSL an overcommitted card does not fai
 
 vLLM normally sizes its KV cache from whatever is free on the card, so next to another engine it would take a different amount each time. aias passes `--kv-cache-memory` instead (450 MB for Whisper; for other models the budget left after the weights of the current revision and 1.5 GiB of overhead), so an instance takes what it was budgeted for. If that KV cache cannot hold one `max_model_len` sequence (layers, KV heads and head size from the model's `config.json`), `model_up` refuses and says which `vram_mib` would.
 
-When a model does not fit, `model_up` changes nothing and returns `{refused, fits, need_mib, free_mib, evict}`. `evict` is the fewest models to stop, never pinned ones or ones running a job. Among sets of that size, it compares the most recently used member of each and picks the set where that one was used longest ago (then the next most recent, and so on), so the models used last are the last to go; pass `evict: "auto"` to stop exactly those. The job plans again once it holds the placement lock and stops the whole set or nothing. If even that is not enough, `evict` is empty and the reason says so. nemo holds one model, so asking for a different one replaces it (unless it is pinned or busy); vLLM models do not replace each other.
+When a model does not fit, `model_up` changes nothing and returns `{refused, fits, need_mib, free_mib, evict}`. `evict` is the fewest models to stop, never pinned ones or ones running a job. Among sets of that size, it compares the most recently used member of each and picks the set where that one was used longest ago (then the next most recent, and so on), so the models used last are the last to go; pass `evict: "auto"` to stop exactly those. The job plans again once it holds the placement lock and stops the whole set or nothing. The lock covers only that decision: the model is booked (listed, not ready) and the lock released before it starts, so another model or a diarization can be admitted while a vLLM model spends a minute or two loading; a start that fails or is cancelled gives its booking back. If even that is not enough, `evict` is empty and the reason says so. nemo holds one model, so asking for a different one replaces it (unless it is pinned or busy); vLLM models do not replace each other.
 
 Every 10 s aias compares nvidia-smi with the ledger. If more is in use than the ledger and the desktop reserve explain, `status` shows `pressure: true` and new models are refused until it clears; nothing running is stopped. `over_budget` means clients loaded more into Ollama directly than the budget allows, and `cpu_offload` on an Ollama model means Ollama itself put part of it in system memory.
 
@@ -148,6 +148,8 @@ Whisper drifts from traditional to simplified Chinese after about 30 seconds, he
 
 vLLM splits long audio into clips of up to 30 s by itself. The finished job's `result` holds `text` (the whole transcript), `segments` (each with `start`, `end` in seconds and `text`), `audio_s` and `elapsed_s`.
 
+With several Whisper models up, `model` picks one; left out, the one used most recently. The result's `model` says which ran.
+
 ### Transcript with speakers
 
 `transcribe` with `diarize: true` decodes the audio once and sends the same WAV to Whisper and to nemo (offline mode) at the same time. Both models must already be up; the error names the `model_up` that is missing. The diarization's GPU reservation follows the same rule as `diarize` (refused with a plan unless `evict: "auto"`).
@@ -174,7 +176,7 @@ Setup imports Ubuntu 24.04 as a WSL distro named `aias` under `C:\ProgramData\ai
 | `http://127.0.0.1:11434/v1` | Ollama, OpenAI compatible |
 | `http://127.0.0.1:8000/v1` to `:8009/v1` | vLLM, OpenAI compatible, one port per model; `status` gives each model's `base_url` |
 
-nemo has no port of its own: only the MCP server talks to it. Each vLLM model runs in its own container made with `docker compose run`, named `aias-vllm-<port>` and labelled `aias.engine=vllm`, `aias.model`, `aias.port` and what the ledger booked for it; `compose stop` does not reach such containers, so aias finds, stops and (after a restart of the MCP server) re-adopts them by these labels.
+nemo has no port of its own: only the MCP server talks to it. Each vLLM model runs in its own container made with `docker compose run`, named `aias-vllm-<port>` and labelled `aias.engine=vllm`, `aias.model`, `aias.port` and what the ledger booked for it; `compose stop` does not reach such containers, so aias finds, stops and (after a restart of the MCP server) re-adopts them by these labels. If a port is taken by something outside aias, the next free one is used. The single `aias-vllm-1` container of earlier versions is stopped when found running, and removed by `model_down {}`.
 
 ## Limitations
 
