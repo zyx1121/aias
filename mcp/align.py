@@ -38,7 +38,10 @@ def label(segments: list[dict[str, Any]], rttm: str) -> list[dict[str, Any]]:
     out = []
     for seg in segments:
         start, end = seg["start"], seg["end"]
-        dur = max(end - start, 1e-6)
+        if end <= start:
+            out.append({**seg, **_at_instant(start, turns)})
+            continue
+        dur = end - start
         talk: dict[str, float] = defaultdict(float)
         for t_start, t_end, speaker in turns:
             if t_start >= end:
@@ -57,6 +60,15 @@ def label(segments: list[dict[str, Any]], rttm: str) -> list[dict[str, Any]]:
             "speaker_uncertain": share < MIN_SHARE or second_s / dur >= MIXED_SHARE,
         })
     return out
+
+
+def _at_instant(t: float, turns: list[tuple[float, float, str]]) -> dict[str, Any]:
+    """A segment with no length: whoever is talking at that instant."""
+    here = sorted({speaker for start, end, speaker in turns if start <= t < end})
+    if len(here) == 1:
+        return {"speaker": here[0], "speaker_confidence": 1.0, "speaker_uncertain": False}
+    # Nobody, or an overlap: take the first for a label, but flag it.
+    return {"speaker": here[0] if here else None, "speaker_confidence": 0.0, "speaker_uncertain": True}
 
 
 def turns(segments: list[dict[str, Any]], language: str) -> list[dict[str, Any]]:

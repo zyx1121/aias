@@ -38,7 +38,7 @@ from starlette.responses import JSONResponse
 
 import align
 import vram
-from audio import AudioError, fetch_wav
+from audio import MAX_AUDIO_SECS, AudioError, fetch_wav
 
 Engine = Literal["ollama", "vllm", "nemo"]
 ENGINES: tuple[Engine, ...] = ("ollama", "vllm", "nemo")
@@ -604,6 +604,22 @@ def _plan(need: int, protect: set[str], replace: list[str]) -> vram.Plan:
     )
 
 
+def _diarize_capacity(model: str, freed_mib: int = 0) -> float:
+    """Longest file (minutes, rounded down to 0.1) whose diarization is admitted now
+    without evicting anything, by the same check the reservation makes. freed_mib
+    counts memory as already released (the bursts of jobs still running)."""
+    card = CARD["smi"] or {}
+    free = card.get("free")
+    return vram.diarize_capacity_min(
+        STORE.burst_rate(model),
+        vram.budget(card.get("total", 0)),
+        _reserved() - freed_mib,
+        None if free is None else free + freed_mib,
+        CARD["pressure"],
+        MAX_AUDIO_SECS / 60,
+    )
+
+
 def _refusal(plan: vram.Plan) -> dict[str, Any]:
     return {"refused": True, **plan.view()}
 
@@ -689,8 +705,10 @@ def _start_job(job: Job, work: Any) -> dict[str, Any]:
         finally:
             job.finished = time.time()
             BURSTS.pop(job.id, None)
-            if job.instance in INSTANCES and job.kind != "up":
-                INSTANCES[job.instance].last_used = time.time()
+            if job.kind != "up":
+                for key in (job.instance, *job.also):
+                    if key in INSTANCES:
+                        INSTANCES[key].last_used = time.time()
 
     JOBS[job.id] = job
     job.task = asyncio.create_task(runner())
@@ -931,7 +949,11 @@ async def _reserve_burst(job: Job, mib: int, evict: str, protect: set[str]) -> N
         plan = _plan(mib, protect, [])
         if not plan.can_fit or (not plan.fits and evict != "auto"):
             job.result = _refusal(plan)
-            raise RuntimeError(plan.reason or f"the {mib} MiB this job needs does not fit")
+            nemo = next((INSTANCES[k] for k in protect if k.startswith("nemo:") and k in INSTANCES), None)
+            if nemo is not None:
+                job.result["max_audio_minutes"] = _diarize_capacity(nemo.model)
+            limit = f"; at most {math.floor(job.result['max_audio_minutes'])} minutes fit now" if nemo else ""
+            raise RuntimeError((plan.reason or f"the {mib} MiB this job needs does not fit") + limit)
         await _carry_out(job, plan)
         BURSTS[job.id] = mib
 
@@ -1097,6 +1119,13 @@ async def status() -> dict[str, Any]:
         if inst.engine == "ollama":
             entry["managed"] = inst.managed
             entry["cpu_offload"] = inst.cpu_offload
+        if inst.engine == "nemo":
+            # Longest file a diarize (alone or with transcribe) is admitted for now.
+            entry["max_audio_minutes"] = _diarize_capacity(inst.model)
+            in_flight = sum(BURSTS.get(j.id, 0) for j in _jobs_of(inst.key))
+            if in_flight:
+                # nemo runs one file at a time; a new one waits, then gets this.
+                entry["max_audio_minutes_next"] = _diarize_capacity(inst.model, freed_mib=in_flight)
         up.append(entry)
     if "ollama" in running and not any(i.engine == "ollama" for i in INSTANCES.values()):
         # The server is up with nothing loaded; keep the old one-entry shape.
