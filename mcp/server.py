@@ -820,7 +820,7 @@ async def _place(job: Job, inst: Instance, evict: str, start: Any) -> str:
     start it. PLACEMENT is held only to decide: what to replace or evict comes from
     the ledger as it is now, and the model is booked (a placeholder, not ready)
     before the lock is released, so the minutes a start takes do not hold up other
-    admissions. A failed or cancelled start takes its booking back. The footprint
+    admissions. A failed or cancelled start takes its booking back at once. The footprint
     is measured only when nothing else claimed or released memory meanwhile."""
     async with PLACEMENT:
         job.detail = "waiting for room on the GPU"
@@ -857,10 +857,13 @@ async def _place(job: Job, inst: Instance, evict: str, start: Any) -> str:
     try:
         detail = await start(job, inst)
     except BaseException:
-        async with PLACEMENT:
-            if INSTANCES.get(inst.key) is inst:
-                del INSTANCES[inst.key]
-                _touch()
+        # Take the booking back at once, with no await: waiting for PLACEMENT here
+        # could itself be cancelled (model_down cancels, then waits) and leave the
+        # model booked and "starting" for good. Dropping a booking only frees
+        # ledger room, so a plan being made under the lock meanwhile stays safe.
+        if INSTANCES.get(inst.key) is inst:
+            del INSTANCES[inst.key]
+            _touch()
         raise
     inst.starting = False
     inst.last_used = inst.since = time.time()
