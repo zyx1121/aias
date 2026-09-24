@@ -38,7 +38,7 @@ from starlette.responses import JSONResponse
 
 import align
 import vram
-from audio import MAX_AUDIO_SECS, AudioError, fetch_wav
+from audio import MAX_AUDIO_SECS, WORK, AudioError, fetch_wav
 
 Engine = Literal["ollama", "vllm", "nemo"]
 ENGINES: tuple[Engine, ...] = ("ollama", "vllm", "nemo")
@@ -1043,7 +1043,7 @@ async def _with_audio(job: Job, audio_url: str, work: Any) -> Any:
     run work(client, wav, audio_s), which calls one engine or several."""
     try:
         async with asyncio.timeout(AUDIO_JOB_SECS):
-            with tempfile.TemporaryDirectory(prefix=AUDIO_TMP_PREFIX) as tmp:
+            with tempfile.TemporaryDirectory(prefix=AUDIO_TMP_PREFIX, dir=WORK) as tmp:
                 job.detail = "downloading and decoding the audio"
                 wav, audio_s = await fetch_wav(audio_url, Path(tmp))
                 job.detail = f"processing {audio_s / 60:.0f} min of audio"
@@ -1646,8 +1646,11 @@ async def health(_: Request) -> JSONResponse:
 
 if __name__ == "__main__":
     # Audio a previous run was working on when it stopped.
-    for leftover in Path(tempfile.gettempdir()).glob(f"{AUDIO_TMP_PREFIX}*"):
+    for leftover in Path(WORK).glob(f"{AUDIO_TMP_PREFIX}*"):
         shutil.rmtree(leftover, ignore_errors=True)
+    # Job directories are 0700 once decoded; the decoder may enter only its own.
+    with contextlib.suppress(OSError):
+        os.chmod(WORK, 0o711)
     mcp.run(
         "streamable-http",
         host="0.0.0.0",

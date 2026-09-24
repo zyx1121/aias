@@ -105,7 +105,7 @@ Every 10 s aias compares nvidia-smi with the ledger. If more is in use than the 
 
 ## Audio input
 
-`diarize` and `transcribe` take an `audio_url`. The MCP server downloads it, decodes it to 16 kHz mono, and only then hands it to the engine. ffmpeg runs as `nobody` with `no_new_privs` and file size and memory limits (`prlimit` and `setpriv`), so a hostile file cannot reach the Docker socket the MCP server holds. Limits:
+`diarize` and `transcribe` take an `audio_url`. The MCP server downloads it, decodes it to 16 kHz mono, and only then hands it to the engine. The decoding runs in a separate `decoder` container, one `compose run` per file: no network (`network_mode: none`), a read-only root with a small tmpfs, no capabilities, `no-new-privileges`, uid 65534, memory and process limits, no GPU and no Docker socket; inside it `prlimit` caps the output file and address space. It sees the shared `audio-work` volume, where only its own job directory is open to it. A hostile file therefore cannot reach the Docker socket the MCP server holds, or the network. Limits:
 
 - http or https, any format ffmpeg reads, up to 2 GB and 10 minutes of download
 - up to 2 hours of audio, so offline diarization fits in 10 GB of GPU memory

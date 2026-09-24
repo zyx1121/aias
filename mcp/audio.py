@@ -2,7 +2,9 @@
 
 Every tool that takes audio (diarize, transcribe) goes through fetch_wav, so
 the URL checks and size limits live in one place and the engines only ever
-see a bounded local file.
+see a bounded local file. The MCP server downloads; the decoding itself runs
+in the decoder container (decoder/, compose.yaml), which has no network, no
+Docker socket, no capabilities and a read-only root.
 """
 
 from __future__ import annotations
@@ -11,9 +13,10 @@ import asyncio
 import contextlib
 import ipaddress
 import os
-import signal
 import socket
 import stat
+import subprocess
+import uuid
 import wave
 from pathlib import Path
 
@@ -35,18 +38,14 @@ PROBE_SECS = 60
 # How long to wait for a killed decoder to be reaped.
 REAP_SECS = 5
 MAX_REDIRECTS = 5
-# ffmpeg and ffprobe parse untrusted files in a container that holds the Docker
-# socket, so they run as nobody, which cannot open the socket, with no way to
-# regain privileges and limits on what they can write and map. 2 GiB of
-# address space decodes 2 hours of FLAC.
+# The decoder runs as nobody. 2 GiB of address space decodes 2 hours of FLAC.
 NOBODY = 65534
 DECODER_MAX_AS = 2 * 1024**3
-# util-linux tools, applied by exec in turn (no Python runs after fork):
-# prlimit sets the limits, setpriv drops to nobody and sets no_new_privs.
-SANDBOX = [
-    "prlimit", f"--fsize={MAX_WAV_BYTES}", f"--as={DECODER_MAX_AS}", "--",
-    "setpriv", "--no-new-privs", f"--reuid={NOBODY}", f"--regid={NOBODY}", "--clear-groups", "--",
-]
+# The volume the MCP server and the decoder share, and the decoder's service.
+WORK = Path(os.environ.get("AIAS_AUDIO_WORK", "/work"))
+COMPOSE = ["docker", "compose", "-f", os.environ.get("AIAS_COMPOSE", "/opt/aias/compose.yaml")]
+TOO_LONG_EXIT = 3  # decode.sh: the probed duration is over the limit
+FSIZE_EXIT = 128 + 25  # killed by SIGXFSZ: the output hit RLIMIT_FSIZE
 
 
 class AudioError(Exception):
@@ -124,66 +123,32 @@ async def _download(url: str, dest: Path) -> None:
         raise AudioError(f"could not download audio_url: {type(exc).__name__} {exc}".rstrip()) from exc
 
 
-# Only one decode at a time, so killing every process nobody owns after it
-# cannot hit another job's decoder. Decoding takes seconds.
-_DECODE_LOCK = asyncio.Lock()
+def _remove_container(name: str) -> None:
+    subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True, timeout=60)
 
 
-def _nobody_pids() -> list[int]:
-    """Live processes in this container whose real or effective uid is nobody."""
-    pids = []
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit():
-            continue
-        try:
-            with open(f"/proc/{entry}/status") as f:
-                fields = dict(line.split(":", 1) for line in f if ":" in line)
-        except OSError:
-            continue
-        uids = fields.get("Uid", "").split()
-        if fields.get("State", "").strip().startswith("Z"):
-            continue  # already dead, waiting for init to reap it
-        if uids[:2] and NOBODY in {int(u) for u in uids[:2]}:
-            pids.append(int(entry))
-    return pids
-
-
-async def _kill_nobody() -> None:
-    """Kill whatever a decoder left behind (a forked child keeps running after the
-    decoder exits). Repeats until none is left, in case one forks while dying."""
-    for _ in range(20):
-        pids = _nobody_pids()
-        if not pids:
-            return
-        for pid in pids:
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(pid, signal.SIGKILL)
-        await asyncio.sleep(0.05)
-
-
-async def _run_decoder(args: list[str], timeout: float) -> tuple[int, str, str]:
-    """Run ffmpeg or ffprobe inside SANDBOX. prlimit and setpriv exec rather than
-    fork, so the process is the decoder itself. Call with _DECODE_LOCK held: when
-    it ends, however it ends, every process nobody owns is killed, so neither a
-    timeout, a cancel nor a forked child leaves anything behind."""
+async def _run_decoder(src: Path, wav: Path, timeout: float) -> tuple[int, str, str]:
+    """Run decode.sh in a fresh decoder container named for this run. When it
+    ends, however it ends (done, failed, timed out, cancelled), the container is
+    removed, and with it every process the decoder started."""
+    name = f"aias-decoder-{uuid.uuid4().hex[:12]}"
     proc = await asyncio.create_subprocess_exec(
-        *SANDBOX,
-        *args,
+        *COMPOSE, "run", "--rm", "--no-deps", "-T", "--name", name, "decoder",
+        str(src), str(wav), str(MAX_AUDIO_SECS), str(MAX_WAV_BYTES), str(DECODER_MAX_AS),
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        # A child that inherited the pipes keeps communicate() waiting after the
-        # decoder exits; the timeout covers that too.
         out, err = await asyncio.wait_for(proc.communicate(), timeout)
     finally:
         if proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
-        await _kill_nobody()
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(proc.wait(), REAP_SECS)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(proc.wait(), REAP_SECS)
+        # --rm covers a normal end; a killed client leaves the container running.
+        await asyncio.to_thread(_remove_container, name)
     return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
 
 
@@ -206,46 +171,25 @@ def _wav_seconds(wav: Path) -> float:
         return w.getnframes() / w.getframerate()
 
 
-async def _probe_seconds(src: Path) -> float | None:
-    try:
-        _, out, _ = await _run_decoder(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(src)],
-            PROBE_SECS,
-        )
-    except TimeoutError:
-        return None
-    try:
-        return float(out.strip())
-    except ValueError:
-        return None
-
-
 async def _decode(src: Path, wav: Path) -> None:
-    """Decode src to 16 kHz mono s16 WAV at wav. Call with _DECODE_LOCK held."""
+    """Decode src to 16 kHz mono s16 WAV at wav in the decoder container."""
     limit = f"the limit is {MAX_AUDIO_SECS} seconds"
-    probed = await _probe_seconds(src)
-    if probed is not None and probed > MAX_AUDIO_SECS:
-        raise AudioError(f"audio is {_seconds(probed)}; {limit}")
-    # -t and -fs bound the decoded size even when the container's duration is
-    # missing or wrong; RLIMIT_FSIZE backs up -fs.
     try:
-        code, _, err = await _run_decoder(
-            ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", str(src),
-             "-t", str(MAX_AUDIO_SECS + 1), "-fs", str(MAX_WAV_BYTES - FS_HEADROOM),
-             "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(wav)],
-            DECODE_SECS,
-        )
+        code, out, err = await _run_decoder(src, wav, PROBE_SECS + DECODE_SECS)
     except TimeoutError:
-        raise AudioError(f"decoding the audio took longer than {DECODE_SECS} s") from None
-    if code == -signal.SIGXFSZ:
+        raise AudioError(f"decoding the audio took longer than {PROBE_SECS + DECODE_SECS} s") from None
+    if code == TOO_LONG_EXIT:
+        probed = next((line.split("=", 1)[1] for line in out.splitlines() if line.startswith("duration=")), "")
+        raise AudioError(f"audio is {_seconds(float(probed))}; {limit}")
+    if code == FSIZE_EXIT:
         raise AudioError(f"audio is longer than the {MAX_AUDIO_SECS} second limit")
     if code != 0:
         raise AudioError(f"ffmpeg could not decode the audio: {err.strip()[-500:]}")
 
 
 def _check_wav(wav: Path) -> float:
-    """Length of the decoded WAV, within the limits. Call once nothing running as
-    nobody can reach the file any more."""
+    """Length of the decoded WAV, within the limits. Call once the decoder
+    container is gone and the directory is root's again."""
     duration = _wav_seconds(wav)
     if duration > MAX_AUDIO_SECS:
         # Decoding stopped at the cap, so the real length is unknown.
@@ -261,16 +205,15 @@ async def fetch_wav(url: str, workdir: Path) -> tuple[Path, float]:
     os.chown(workdir, NOBODY, NOBODY)
     src, wav = workdir / "input", workdir / "audio.wav"
     await _download(url, src)
-    async with _DECODE_LOCK:
-        try:
-            await _decode(src, wav)
-        finally:
-            # Nothing of the decoder's may outlive it, and the directory goes back
-            # to root before the WAV is checked, so the checked file is the one
-            # the engine reads.
-            await _kill_nobody()
-            os.chown(workdir, 0, 0)
-            os.chmod(workdir, 0o700)
+    # The decoder reads the input as nobody.
+    os.chmod(src, 0o644)
+    try:
+        await _decode(src, wav)
+    finally:
+        # The decoder container is gone by now; the directory goes back to root
+        # before the WAV is checked, so the checked file is the one the engine reads.
+        os.chown(workdir, 0, 0)
+        os.chmod(workdir, 0o700)
     duration = _check_wav(wav)
     src.unlink(missing_ok=True)
     return wav, duration
