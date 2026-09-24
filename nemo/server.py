@@ -37,6 +37,11 @@ MAX_BYTES = 2 * 1024**3
 # Offline peak GPU memory grows about 40 MiB per minute of audio (3.5 GB at
 # 87 minutes), so 2 hours stays inside a 10 GB card next to the desktop.
 MAX_AUDIO_SECS = 2 * 3600
+# 2 hours of 16 kHz mono s16 is 230.4 MB; -fs stops ffmpeg a little past that
+# even when the input's timestamps defeat -t (chained Ogg streams restart them).
+MAX_WAV_BYTES = 240_000_000
+# ffmpeg checks -fs after writing each packet, so leave room for one.
+FS_HEADROOM = 64 * 1024
 DOWNLOAD_SECS = 600
 DECODE_SECS = 600
 MAX_REDIRECTS = 5
@@ -105,7 +110,12 @@ async def _download(url: str, dest: Path) -> None:
                     resp = await client.send(request, stream=True)
                     try:
                         if resp.is_redirect:
-                            target = target.join(resp.headers["location"])
+                            location = resp.headers.get("location")
+                            if not location:
+                                raise BadRequest(
+                                    f"audio_url answered HTTP {resp.status_code} without a Location header"
+                                )
+                            target = target.join(location)
                             continue
                         if resp.status_code != 200:
                             raise BadRequest(f"audio_url answered HTTP {resp.status_code}")
@@ -149,10 +159,10 @@ def _diarize(src: Path, mode: str) -> dict[str, Any]:
     if probed is not None and probed > MAX_AUDIO_SECS:
         raise _too_long(probed)
     wav = src.with_suffix(".16k.wav")
-    # -t bounds the decoded size even when the container's duration is missing or wrong.
+    # -t and -fs bound the decoded size even when the container's duration is missing or wrong.
     proc = subprocess.run(
         ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", str(src),
-         "-t", str(MAX_AUDIO_SECS + 1), "-ac", "1", "-ar", "16000", str(wav)],
+         "-t", str(MAX_AUDIO_SECS + 1), "-fs", str(MAX_WAV_BYTES - FS_HEADROOM), "-ac", "1", "-ar", "16000", str(wav)],
         capture_output=True,
         text=True,
         timeout=DECODE_SECS,
