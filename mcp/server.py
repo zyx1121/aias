@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -41,7 +42,8 @@ VLLM_STARTUP_SECS = 900
 NEMO_STARTUP_SECS = 600
 NEMO_BUILD_SECS = 3600
 # nemo loads .nemo archives, which can carry pickled code: only NVIDIA's repos.
-NEMO_REPO_PREFIX = "nvidia/"
+# One path segment under nvidia/, so `nvidia/../other/repo` cannot slip through.
+NEMO_REPO = re.compile(r"nvidia/(?!\.+$)[A-Za-z0-9_.-]+")
 # One diarize call end to end: the engine caps the download at 10 minutes and
 # the audio at 2 hours, which ultralow mode needs about 25 minutes for.
 DIARIZE_SECS = 3600
@@ -389,8 +391,8 @@ async def _up_vllm(job: Job, max_model_len: int, gpu_memory_utilization: float) 
 
 
 def _check_nemo_repo(model: str) -> None:
-    if not model.startswith(NEMO_REPO_PREFIX):
-        raise ToolError(f"nemo only loads Hugging Face repos under {NEMO_REPO_PREFIX}, not {model}")
+    if not NEMO_REPO.fullmatch(model):
+        raise ToolError(f"nemo only loads Hugging Face repos named nvidia/<name>, not {model}")
 
 
 async def _up_nemo(job: Job) -> str:
