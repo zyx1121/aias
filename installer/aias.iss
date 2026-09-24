@@ -28,6 +28,7 @@ SetupLogging=yes
 Source: "..\scripts\*"; DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "..\wsl\*"; DestDir: "{app}\wsl"; Flags: ignoreversion
 Source: "..\mcp\*"; DestDir: "{app}\mcp"; Flags: ignoreversion
+Source: "..\nemo\*"; DestDir: "{app}\nemo"; Flags: ignoreversion
 
 [UninstallRun]
 Filename: "powershell.exe"; \

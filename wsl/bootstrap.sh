@@ -27,9 +27,11 @@ systemctl restart docker
 
 step "Installing the stack to $DEST"
 install -d "$DEST"
-rm -rf "$DEST/mcp"
+rm -rf "$DEST/mcp" "$DEST/nemo"
 cp "$SRC/wsl/compose.yaml" "$DEST/compose.yaml"
 cp -r "$SRC/mcp" "$DEST/mcp"
+# Built by the MCP server on the first `model_up engine=nemo`, not here.
+cp -r "$SRC/nemo" "$DEST/nemo"
 compose=(docker compose -f "$DEST/compose.yaml")
 
 step "Building and starting the MCP server"

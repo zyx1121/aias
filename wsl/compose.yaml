@@ -1,7 +1,7 @@
 # aias stack inside the `aias` WSL distro, installed to /opt/aias.
 # `docker compose up -d` starts only the MCP server. The engines sit in the
 # `engine` profile and are started by the MCP tools, one at a time, because a
-# single consumer GPU cannot hold both.
+# single consumer GPU cannot hold two models.
 name: aias
 
 services:
@@ -48,7 +48,21 @@ services:
       - --max-model-len=${VLLM_MAX_LEN:-8192}
       - --gpu-memory-utilization=${VLLM_GPU_UTIL:-0.8}
 
+  # Speaker diarization. Built on first use (about 11 GB), not at install.
+  # No published port: the MCP server calls it on the compose network.
+  nemo:
+    build: ./nemo
+    image: aias-nemo:local
+    profiles: [engine]
+    gpus: all
+    environment:
+      NEMO_MODEL: ${NEMO_MODEL:-nvidia/Nemotron-3-Diarization}
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+      - nemo-cache:/cache
+
 volumes:
   hf-cache:
   vllm-cache:
+  nemo-cache:
   ollama:
