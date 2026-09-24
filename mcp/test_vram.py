@@ -112,6 +112,13 @@ class NemoBurst(unittest.TestCase):
             store.record_burst("m", 3400, 5203)
             self.assertAlmostEqual(store.burst_rate("m"), 39.21, places=2)
 
+    def test_default_rate_fits_ep103_next_to_whisper(self):
+        # king: Whisper 4187 + nemo 843; EP103 is 5203 s.
+        burst = vram.nemo_burst_mib(5203, None)
+        self.assertEqual(burst, 3469)
+        self.assertLessEqual(4187 + 843 + burst, BUDGET)
+        self.assertEqual(round(vram.diarize_minutes(BUDGET - 4187 - 843, None), 1), 91.8)
+
     def test_floor(self):
         self.assertEqual(vram.nemo_burst_mib(5, 39.2), vram.NEMO_BURST_FLOOR_MIB)
         self.assertEqual(vram.nemo_burst_mib(5203, 39.2), 3399)

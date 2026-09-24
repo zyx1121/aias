@@ -37,10 +37,10 @@ OLLAMA_FALLBACK_FACTOR = 2.0
 OLLAMA_FALLBACK_MIN_EXTRA_MIB = 2048
 # nemo with the model loaded and no job, at the nvidia-smi level.
 NEMO_BASE_MIB = int(os.environ.get("AIAS_NEMO_BASE_MIB", "1300"))
-# Offline diarization peaks about 36 MiB per minute of audio; until a run has
-# been measured, reserve 20 % more.
-NEMO_BURST_MIB_PER_MIN = 36
-NEMO_BURST_FACTOR = 1.2
+# Offline diarization adds about 40 MiB of GPU memory per minute of audio
+# (39.2 to 40.25 measured on king). Used until a run has been measured; the
+# 512 MiB safety margin absorbs the difference.
+NEMO_BURST_MIB_PER_MIN = 40
 # Short files carry a fixed overhead that would inflate a per-minute rate
 # (a 5 s clip measured 240 MiB/min), so only runs this long set the rate,
 # and no reservation is smaller than the floor.
@@ -109,9 +109,17 @@ def ollama_estimate_mib(file_mib: int, model_info: dict[str, Any] | None) -> tup
 
 def nemo_burst_mib(audio_s: float, measured_per_min: float | None = None) -> int:
     """Memory a diarize run adds on top of the idle engine: the highest rate seen in
-    a measured run, else the estimate with its margin."""
-    rate = measured_per_min or NEMO_BURST_MIB_PER_MIN * NEMO_BURST_FACTOR
-    return max(NEMO_BURST_FLOOR_MIB, round(rate * audio_s / 60))
+    a measured run, else NEMO_BURST_MIB_PER_MIN."""
+    return max(NEMO_BURST_FLOOR_MIB, round(burst_rate(measured_per_min) * audio_s / 60))
+
+
+def burst_rate(measured_per_min: float | None) -> float:
+    return measured_per_min or NEMO_BURST_MIB_PER_MIN
+
+
+def diarize_minutes(room_mib: int, measured_per_min: float | None) -> float:
+    """Minutes of audio whose diarization burst fits in room_mib."""
+    return max(0.0, room_mib / burst_rate(measured_per_min))
 
 
 class Store:

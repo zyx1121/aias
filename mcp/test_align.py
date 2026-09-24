@@ -41,6 +41,26 @@ class Label(unittest.TestCase):
         self.assertTrue(short["speaker_uncertain"])
 
 
+class ZeroLength(unittest.TestCase):
+    def test_inside_a_turn(self):
+        (out,) = align.label([seg(6.0, 6.0, "嗯")], RTTM)
+        self.assertEqual((out["speaker"], out["speaker_confidence"], out["speaker_uncertain"]), ("guest", 1.0, False))
+
+    def test_in_a_gap(self):
+        (out,) = align.label([seg(5.1, 5.1, "嗯")], RTTM)
+        self.assertIsNone(out["speaker"])
+        self.assertTrue(out["speaker_uncertain"])
+
+    def test_during_overlap(self):
+        rttm = RTTM + "\nSPEAKER audio 1 6.000 1.000 <NA> <NA> host <NA> <NA>"
+        (out,) = align.label([seg(6.5, 6.5, "嗯")], rttm)
+        self.assertTrue(out["speaker_uncertain"])
+
+    def test_negative_length(self):
+        (out,) = align.label([seg(1.0, 0.9, "x")], RTTM)
+        self.assertEqual(out["speaker"], "host")
+
+
 class Turns(unittest.TestCase):
     def test_merges_adjacent_same_speaker(self):
         segs = align.label([seg(0.5, 2.0, "你好"), seg(2.0, 4.5, "歡迎"), seg(5.3, 8.0, "謝謝")], RTTM)

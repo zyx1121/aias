@@ -95,7 +95,7 @@ The ledger decides, not nvidia-smi: under WSL an overcommitted card does not fai
 | any model | a measurement: nvidia-smi before and after a start with no other job running and nothing stopped for it, kept in the `aias-state` volume |
 | vLLM | `gpu_memory_utilization` x card: 0.4 for Whisper, 0.8 otherwise |
 | Ollama | what `/api/ps` reports once loaded, + 250 MiB; before that the model file + its KV cache at the 32k context (layers, KV heads and head size from `/api/show`) + 250 MiB, or twice the file if the metadata is missing |
-| nemo | 1300 MiB, plus a per-file reservation during `diarize`: the highest MiB per minute measured on a file of 10 minutes or more (about 39), or 43 before such a run, and at least 128 MiB |
+| nemo | 1300 MiB, plus a per-file reservation during `diarize`: the highest MiB per minute measured on a file of 10 minutes or more (39.2 on king), or 40 before such a run, and at least 128 MiB |
 
 vLLM normally sizes its KV cache from whatever is free on the card, so next to another engine it would take a different amount each time. aias passes `--kv-cache-memory` instead (450 MB for Whisper; for other models the budget left after the weights of the current revision and 1.5 GiB of overhead), so an instance takes what it was budgeted for. If that KV cache cannot hold one `max_model_len` sequence (layers, KV heads and head size from the model's `config.json`), `model_up` refuses and says which `vram_mib` would.
 
@@ -159,6 +159,8 @@ Each Whisper segment gets the speaker who talks the most during it:
 | `speaker` | Label from the diarization (`speaker_0`, ...), or null if nobody was labelled during the segment |
 | `speaker_confidence` | Share of the segment that speaker talks, 0 to 1 |
 | `speaker_uncertain` | True when that share is under 0.3, or a second speaker talks 0.3 or more of it (the segment straddles a change) |
+
+How long a file fits depends on what else is up: the diarization reservation must fit in (budget − models up) ÷ MiB per minute. On a 10 GB card with Whisper (4187 MiB) and nemo (843 MiB) up, that is (8704 − 4187 − 843) ÷ 39.2 ≈ 93 minutes (92 at the default 40 MiB per minute, before a long file has been measured); nemo alone takes the full 2 hours. `status` shows the current figure as `max_audio_minutes` on the nemo entry, and a refused run says it too.
 
 Segments are not split: Whisper cuts on pauses, and a split at a guessed word boundary would be less reliable than the flag. The result also holds `speakers` (seconds from the diarization and segments per speaker), `turns` (adjacent segments of one speaker merged, with `start`, `end`, `text`), the `rttm`, and `transcribe_s` / `diarize_s` next to `elapsed_s`.
 
