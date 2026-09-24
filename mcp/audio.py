@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import os
+import resource
+import signal
 import socket
-import subprocess
 import wave
 from pathlib import Path
 
@@ -28,7 +30,13 @@ MAX_WAV_BYTES = 240_000_000
 FS_HEADROOM = 5_000_000
 DOWNLOAD_SECS = 600
 DECODE_SECS = 600
+PROBE_SECS = 60
 MAX_REDIRECTS = 5
+# ffmpeg and ffprobe parse untrusted files in a container that holds the Docker
+# socket, so they run as nobody, which cannot open the socket, with limits on
+# what they can write and map. 2 GiB of address space decodes 2 hours of FLAC.
+NOBODY = 65534
+DECODER_MAX_AS = 2 * 1024**3
 
 
 class AudioError(Exception):
@@ -106,43 +114,79 @@ async def _download(url: str, dest: Path) -> None:
         raise AudioError(f"could not download audio_url: {type(exc).__name__} {exc}".rstrip()) from exc
 
 
-def _probe_seconds(src: Path) -> float | None:
-    proc = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(src)],
-        capture_output=True,
-        text=True,
-        timeout=60,
+def _limit_decoder() -> None:
+    # Runs in the child between fork and exec.
+    resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_WAV_BYTES, MAX_WAV_BYTES))
+    resource.setrlimit(resource.RLIMIT_AS, (DECODER_MAX_AS, DECODER_MAX_AS))
+
+
+async def _run_decoder(args: list[str], timeout: float) -> tuple[int, str, str]:
+    """Run ffmpeg or ffprobe as nobody under _limit_decoder. The process is killed
+    when the job is cancelled or the timeout passes, so none is left behind."""
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        user=NOBODY,
+        group=NOBODY,
+        extra_groups=[],
+        preexec_fn=_limit_decoder,
     )
     try:
-        return float(proc.stdout.strip())
+        out, err = await asyncio.wait_for(proc.communicate(), timeout)
+    except BaseException:  # timeout, or the job cancelled by model_down
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        raise
+    return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
+
+
+def _minutes(seconds: float) -> str:
+    return f"{seconds / 60:.1f} minutes"
+
+
+async def _probe_seconds(src: Path) -> float | None:
+    try:
+        _, out, _ = await _run_decoder(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(src)],
+            PROBE_SECS,
+        )
+    except TimeoutError:
+        return None
+    try:
+        return float(out.strip())
     except ValueError:
         return None
 
 
-def _decode(src: Path, wav: Path) -> float:
+async def _decode(src: Path, wav: Path) -> float:
     """Decode src to 16 kHz mono s16 WAV at wav and return its length in seconds."""
-    probed = _probe_seconds(src)
+    limit = f"the limit is {MAX_AUDIO_SECS // 60} minutes"
+    probed = await _probe_seconds(src)
     if probed is not None and probed > MAX_AUDIO_SECS:
-        raise AudioError(f"audio is {probed / 3600:.1f} hours; the limit is {MAX_AUDIO_SECS // 3600} hours")
-    # -t and -fs bound the decoded size even when the container's duration is missing or wrong.
+        raise AudioError(f"audio is {_minutes(probed)}; {limit}")
+    # -t and -fs bound the decoded size even when the container's duration is
+    # missing or wrong; RLIMIT_FSIZE backs up -fs.
     try:
-        proc = subprocess.run(
+        code, _, err = await _run_decoder(
             ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", str(src),
              "-t", str(MAX_AUDIO_SECS + 1), "-fs", str(MAX_WAV_BYTES - FS_HEADROOM),
              "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(wav)],
-            capture_output=True,
-            text=True,
-            timeout=DECODE_SECS,
+            DECODE_SECS,
         )
-    except subprocess.TimeoutExpired:
+    except TimeoutError:
         raise AudioError(f"decoding the audio took longer than {DECODE_SECS} s") from None
-    if proc.returncode != 0:
-        raise AudioError(f"ffmpeg could not decode the audio: {proc.stderr.strip()[-500:]}")
+    if code == -signal.SIGXFSZ:
+        raise AudioError(f"audio is longer than the {MAX_AUDIO_SECS // 60} minute limit")
+    if code != 0:
+        raise AudioError(f"ffmpeg could not decode the audio: {err.strip()[-500:]}")
     with wave.open(str(wav)) as w:
         duration = w.getnframes() / w.getframerate()
     if duration > MAX_AUDIO_SECS:
         # Decoding stopped at the cap, so the real length is unknown.
-        raise AudioError(f"audio is longer than the {MAX_AUDIO_SECS // 3600} hour limit")
+        raise AudioError(f"audio is longer than the {MAX_AUDIO_SECS // 60} minute limit")
     if duration == 0:
         raise AudioError("audio has no samples")
     return duration
@@ -150,8 +194,10 @@ def _decode(src: Path, wav: Path) -> float:
 
 async def fetch_wav(url: str, workdir: Path) -> tuple[Path, float]:
     """Download url into workdir and decode it. Returns the WAV path and its length."""
+    # The decoder runs as nobody and writes its WAV here.
+    os.chown(workdir, NOBODY, NOBODY)
     src, wav = workdir / "input", workdir / "audio.wav"
     await _download(url, src)
-    duration = await asyncio.to_thread(_decode, src, wav)
+    duration = await _decode(src, wav)
     src.unlink(missing_ok=True)
     return wav, duration

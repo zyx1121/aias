@@ -502,6 +502,8 @@ async def _transcribe(job: Job, audio_url: str, language: str, traditional: bool
         return resp
 
     body = await _audio_job(job, audio_url, "vllm", send)
+    # OpenCC only makes sense for Chinese; it would leave other text alone, but skip it.
+    traditional = traditional and language.lower().startswith("zh")
     convert = _S2TW.convert if traditional else (lambda text: text)
     segments = [
         {"start": round(seg["start"], 2), "end": round(seg["end"], 2), "text": convert(seg["text"].strip())}
@@ -643,7 +645,7 @@ async def transcribe(audio_url: str, language: str = "zh", traditional: bool = T
     model=openai/whisper-large-v3 first). audio_url is an http(s) link the server
     downloads; any format ffmpeg reads, up to 2 GB and 2 hours. language is an ISO 639-1
     code. traditional converts simplified Chinese characters to traditional (Taiwan),
-    because Whisper drifts to simplified. Returns a job; when it is done, job_status
+    because Whisper drifts to simplified; it applies only when language starts with zh. Returns a job; when it is done, job_status
     carries result with the full text and segments (start, end, text) in seconds."""
     running = await asyncio.to_thread(_running)
     model = await asyncio.to_thread(_vllm_model_from_container) if "vllm" in running else None

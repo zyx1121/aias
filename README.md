@@ -79,7 +79,7 @@ Any other MCP client:
 
 ## Audio input
 
-`diarize` and `transcribe` take an `audio_url`. The MCP server downloads it, decodes it to 16 kHz mono, and only then hands it to the engine. Limits:
+`diarize` and `transcribe` take an `audio_url`. The MCP server downloads it, decodes it to 16 kHz mono, and only then hands it to the engine. ffmpeg runs as `nobody` with file size and memory limits, so a hostile file cannot reach the Docker socket the MCP server holds. Limits:
 
 - http or https, any format ffmpeg reads, up to 2 GB and 10 minutes of download
 - up to 2 hours of audio, so offline diarization fits in 10 GB of GPU memory
@@ -116,7 +116,7 @@ Peak GPU memory in offline mode grows with length: 0.75 GB for 10 minutes, 3.5 G
 |----------|---------|
 | `audio_url` | The recording; see [Audio input](#audio-input) |
 | `language` | ISO 639-1 code, `zh` by default |
-| `traditional` | Convert simplified Chinese characters to traditional (OpenCC `s2tw`), on by default |
+| `traditional` | Convert simplified Chinese characters to traditional (OpenCC `s2tw`), on by default; applies only when `language` starts with `zh` |
 
 Whisper drifts from traditional to simplified Chinese after about 30 seconds, hence `traditional`. It converts characters only; it does not swap words such as 軟件 for 軟體, so the text stays what was said.
 
