@@ -10,7 +10,9 @@ used and free are all there is.
 
 from __future__ import annotations
 
+import itertools
 import json
+import logging
 import os
 import subprocess
 import time
@@ -41,6 +43,11 @@ NEMO_BURST_MIB_PER_MIN = 36
 NEMO_BURST_FACTOR = 1.2
 
 STATE_FILE = Path(os.environ.get("AIAS_STATE", "/state")) / "vram.json"
+# Up to this many evictable models, the plan tries every subset for the fewest
+# evictions; past it (unlikely on one card) it falls back to a greedy walk.
+EXHAUSTIVE_MAX = 12
+
+log = logging.getLogger("aias.vram")
 
 
 def smi() -> dict[str, Any] | None:
@@ -108,11 +115,45 @@ class Store:
 
     def __init__(self, path: Path = STATE_FILE) -> None:
         self.path = path
-        self.data: dict[str, Any] = {"measured": {}, "burst_per_min": {}, "pins": [], "managed_ollama": []}
+        self.data: dict[str, Any] = self._defaults()
         try:
-            self.data.update(json.loads(path.read_text()))
-        except (OSError, ValueError):
-            pass
+            loaded = json.loads(path.read_text())
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as exc:
+            log.warning("ignoring unreadable %s: %s", path, exc)
+            return
+        self._adopt(loaded)
+
+    @staticmethod
+    def _defaults() -> dict[str, Any]:
+        return {"measured": {}, "burst_per_min": {}, "pins": [], "managed_ollama": []}
+
+    def _adopt(self, loaded: Any) -> None:
+        """Take each field of the state file only if it has the right shape, so a
+        damaged file costs its bad fields, not the MCP server."""
+        if not isinstance(loaded, dict):
+            log.warning("ignoring %s: not a JSON object", self.path)
+            return
+
+        def good_record(v: Any) -> bool:
+            return isinstance(v, dict) and isinstance(v.get("mib"), int) and v["mib"] > 0
+
+        checks = {
+            "measured": lambda v: isinstance(v, dict) and all(isinstance(k, str) and good_record(r) for k, r in v.items()),
+            "burst_per_min": lambda v: isinstance(v, dict) and all(
+                isinstance(k, str) and isinstance(r, (int, float)) and r > 0 for k, r in v.items()
+            ),
+            "pins": lambda v: isinstance(v, list) and all(isinstance(x, str) for x in v),
+            "managed_ollama": lambda v: isinstance(v, list) and all(isinstance(x, str) for x in v),
+        }
+        for name, ok in checks.items():
+            if name not in loaded:
+                continue
+            if ok(loaded[name]):
+                self.data[name] = loaded[name]
+            else:
+                log.warning("ignoring field %r of %s: unexpected shape", name, self.path)
 
     def save(self) -> None:
         try:
@@ -233,22 +274,35 @@ def make_plan(
     if plan.fits:
         plan.can_fit = True
         return plan
-    # Take candidates least recently used first until it fits, then walk back
-    # from the most recent one taken and drop any the rest can do without. The
-    # result is minimal and still leans on the models idle the longest.
-    chosen: list[Candidate] = []
-    for cand in sorted(candidates, key=lambda c: c.last_used):
-        chosen.append(cand)
-        if ok(base + sum(c.mib for c in chosen)):
-            break
-    else:
+    chosen = _fewest(sorted(candidates, key=lambda c: c.last_used), lambda cs: ok(base + sum(c.mib for c in cs)))
+    if chosen is None:
         plan.reason = "does not fit even after evicting every model that is not pinned and has no job"
         return plan
-    for cand in reversed(chosen[:]):
-        rest = [c for c in chosen if c is not cand]
-        if ok(base + sum(c.mib for c in rest)):
-            chosen = rest
     plan.evict = [c.key for c in chosen]
     plan.can_fit = True
     plan.reason = f"fits after evicting {', '.join(plan.evict)}; pass evict=\"auto\" to do it"
     return plan
+
+
+def _fewest(by_age: list[Candidate], fits: Any) -> list[Candidate] | None:
+    """The fewest candidates whose eviction makes room; among sets of that size, the
+    one idle the longest. by_age is oldest first, and combinations() walks index
+    tuples in lexicographic order, so the first set that fits is that one."""
+    if not fits(by_age):
+        return None
+    if len(by_age) <= EXHAUSTIVE_MAX:
+        for size in range(1, len(by_age) + 1):
+            for combo in itertools.combinations(by_age, size):
+                if fits(list(combo)):
+                    return list(combo)
+    # Greedy fallback: oldest first until it fits, then drop what the rest can do without.
+    chosen: list[Candidate] = []
+    for cand in by_age:
+        chosen.append(cand)
+        if fits(chosen):
+            break
+    for cand in reversed(chosen[:]):
+        rest = [c for c in chosen if c is not cand]
+        if fits(rest):
+            chosen = rest
+    return chosen

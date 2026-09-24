@@ -39,6 +39,24 @@ class EvictionPlan(unittest.TestCase):
         p = plan(4000, 6000, cands)
         self.assertEqual(p.evict, ["old"])
 
+    def test_fewest_not_greedy(self):
+        # Oldest first would take both 1500s; the single 3000 is fewer.
+        cands = [Candidate("a", 1500, 1), Candidate("b", 1500, 2), Candidate("c", 3000, 3)]
+        p = plan(3000, 8704, cands)
+        self.assertEqual(p.evict, ["c"])
+
+    def test_same_count_prefers_oldest(self):
+        cands = [Candidate("new", 3000, 9), Candidate("old", 3000, 1), Candidate("mid", 3000, 5)]
+        p = plan(3000, 8704, cands)
+        self.assertEqual(p.evict, ["old"])
+
+    def test_greedy_fallback_past_the_limit(self):
+        cands = [Candidate(f"m{i}", 100, i) for i in range(vram.EXHAUSTIVE_MAX + 3)]
+        p = plan(1000, 8704, cands)
+        self.assertTrue(p.can_fit)
+        self.assertEqual(len(p.evict), 10)
+        self.assertEqual(p.evict, [f"m{i}" for i in range(10)])
+
     def test_nothing_is_enough(self):
         p = plan(8000, 6000, [Candidate("a", 1000, 1), Candidate("b", 1000, 2)])
         self.assertFalse(p.can_fit)
@@ -74,6 +92,36 @@ QWEN3_8B = {
     "qwen3.context_length": 40960,
     "qwen3.embedding_length": 4096,
 }
+
+
+class StateFile(unittest.TestCase):
+    def load(self, text):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vram.json"
+            path.write_text(text)
+            with self.assertLogs("aias.vram", "WARNING") if text.strip() not in ("{}",) else _nolog():
+                return vram.Store(path).data
+
+    def test_not_an_object(self):
+        self.assertEqual(self.load("[1, 2]"), vram.Store._defaults())
+
+    def test_not_json(self):
+        self.assertEqual(self.load("{oops"), vram.Store._defaults())
+
+    def test_bad_field_dropped_good_kept(self):
+        data = self.load('{"measured": {"a": {"mib": "big"}}, "pins": ["vllm:x"]}')
+        self.assertEqual(data["measured"], {})
+        self.assertEqual(data["pins"], ["vllm:x"])
+
+
+class _nolog:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
 
 class OllamaEstimate(unittest.TestCase):

@@ -27,10 +27,11 @@ from typing import Any, Literal
 
 import httpx
 import opencc
-from huggingface_hub import HfApi, scan_cache_dir, snapshot_download
+from huggingface_hub import HfApi, scan_cache_dir, snapshot_download, try_to_load_from_cache
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import StrictInt
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -109,7 +110,8 @@ mcp = MCPServer(
 _NO_LOCK = contextlib.nullcontext()
 # Serializes compose calls that build, start or stop containers. A cancelled
 # job's `up` keeps running in its worker thread, so a later `stop` must wait for it.
-_COMPOSE_LOCK = threading.Lock()
+# Reentrant, so a check-then-stop can hold it across both steps.
+_COMPOSE_LOCK = threading.RLock()
 # The nemo image build in progress, so model_down can end it instead of
 # waiting minutes for the lock.
 _BUILD: subprocess.Popen[str] | None = None
@@ -258,9 +260,48 @@ def _hf_models() -> list[dict[str, Any]]:
 
 
 def _disk_mib(engine: str, model: str) -> int | None:
-    listing = _ollama_models() if engine == "ollama" else _hf_models()
-    size = next((m["size_gb"] for m in listing if m["model"] == model), None)
+    if engine != "ollama":
+        return _hf_weights_mib(model)
+    size = next((m["size_gb"] for m in _ollama_models() if m["model"] == model), None)
     return None if size is None else round(size * 1e9 / 2**20)
+
+
+def _hf_weights_mib(model: str) -> int | None:
+    """Weights of the revision main points at (safetensors, else .bin), not every
+    revision in the cache."""
+    try:
+        cache = scan_cache_dir()
+    except Exception:
+        return None
+    repo = next((r for r in cache.repos if r.repo_id == model and r.repo_type == "model"), None)
+    if repo is None or not repo.revisions:
+        return None
+    rev = max(repo.revisions, key=lambda r: ("main" in r.refs, r.last_modified))
+    files = [f for f in rev.files if f.file_name.endswith(".safetensors")]
+    files = files or [f for f in rev.files if f.file_name.endswith(".bin")]
+    return round(sum(f.size_on_disk for f in files) / 2**20) if files else None
+
+
+def _kv_mib_for(model: str, max_len: int) -> int | None:
+    """KV cache one max_len sequence needs, from the model's config.json in the
+    cache (None if it is not there or lacks the fields)."""
+    path = try_to_load_from_cache(model, "config.json")
+    if not isinstance(path, str):
+        return None
+    try:
+        cfg = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+    text = cfg.get("text_config") or cfg
+    layers, heads = text.get("num_hidden_layers"), text.get("num_attention_heads")
+    kv_heads = text.get("num_key_value_heads") or heads
+    head_dim = text.get("head_dim") or (text["hidden_size"] // heads if text.get("hidden_size") and heads else None)
+    if not (layers and kv_heads and head_dim):
+        return None
+    dtype = str(text.get("torch_dtype") or cfg.get("torch_dtype") or "bfloat16")
+    size = 4 if dtype == "float32" else 2
+    # K and V, plus 5 % for vLLM's block rounding.
+    return math.ceil(max_len * layers * kv_heads * head_dim * 2 * size * 1.05 / 2**20)
 
 
 def _ollama_name(model: str) -> str:
@@ -337,13 +378,21 @@ def _vllm_config(
         kv = WHISPER_KV_BYTES
     else:
         weights = _disk_mib("vllm", model) or 0
-        kv = max(MIN_KV_MIB, target - weights - VLLM_OVERHEAD_MIB) * 2**20
+        kv_mib = max(MIN_KV_MIB, target - weights - VLLM_OVERHEAD_MIB)
+        if (needed := _kv_mib_for(model, max_len)) and kv_mib < needed:
+            raise ToolError(
+                f"{model} would get a {kv_mib} MiB KV cache, but max_model_len {max_len} needs "
+                f"{needed} MiB; pass vram_mib of at least {weights + VLLM_OVERHEAD_MIB + needed} "
+                "or a smaller max_model_len"
+            )
+        kv = kv_mib * 2**20
     key = f"vllm:{model}:{max_len}:{kv}"
+    # A declaration wins over a measurement, so a wrong measurement can be overridden.
     measured = STORE.measured(key)
-    if measured:
-        need, source = measured, "measured"
-    elif declared:
+    if declared:
         need, source = declared, "declared"
+    elif measured:
+        need, source = measured, "measured"
     else:
         need, source = target, "estimate"
     return {"max_len": max_len, "kv": kv, "record_key": key, "need": need, "source": source}
@@ -367,10 +416,10 @@ async def _simple_need(
 ) -> tuple[int, str, str]:
     """(need, source, record key) for ollama and nemo."""
     key = f"{engine}:{model}"
-    if measured := STORE.measured(key):
-        return measured, "measured", key
     if vram_mib:
         return vram_mib, "declared", key
+    if measured := STORE.measured(key):
+        return measured, "measured", key
     if engine == "nemo":
         return vram.NEMO_BASE_MIB, "estimate", key
     disk = await asyncio.to_thread(_disk_mib, "ollama", model) or 1024
@@ -395,20 +444,27 @@ async def _sync_single(engine: Engine, running: dict[str, Any]) -> None:
         if inst is not None and inst.settled():
             del INSTANCES[inst.key]
         return
-    if inst is not None:
+    if inst is not None and inst.starting:
         return
     if engine == "vllm":
         args = await asyncio.to_thread(_vllm_args_from_container)
-        if not (model := args.get("model")):
+        model = args.get("model")
+    else:
+        model = await asyncio.to_thread(_nemo_model_from_container)
+    if inst is not None:
+        if inst.model == model:
             return
+        # The container runs something else than the ledger says: rebuild from it.
+        del INSTANCES[inst.key]
+    if not model:
+        return
+    if engine == "vllm":
         key = f"vllm:{model}:{args.get('max-model-len')}:{args.get('kv-cache-memory')}"
         util = float(args.get("gpu-memory-utilization", 0) or 0)
         need, source = STORE.measured(key), "measured"
         if not need:
             need, source = round(util * _total()), "estimate"
     else:
-        if not (model := await asyncio.to_thread(_nemo_model_from_container)):
-            return
         need, source, key = await _simple_need("nemo", model, None)
     INSTANCES[f"{engine}:{model}"] = Instance(engine, model, need, source, key)
 
@@ -481,14 +537,38 @@ def _jobs_of(key: str, exclude: Job | None = None) -> list[Job]:
     return [j for j in JOBS.values() if j.state == "running" and j.instance == key and j is not exclude]
 
 
+# Instances an admission is stopping; no job may start on them and no pin may
+# land on them meanwhile, so a plan is carried out whole or not at all.
+EVICTING: set[str] = set()
+
+
 def _evictable(key: str) -> bool:
     inst = INSTANCES.get(key)
     return (
         inst is not None
         and not inst.starting
+        and key not in EVICTING
         and not STORE.pinned(key)
         and not _jobs_of(key)
     )
+
+
+async def _carry_out(job: Job, plan: vram.Plan) -> list[str]:
+    """Evict what plan lists, all or nothing: every target is checked again (in
+    PLACEMENT, after the plan) and marked, so none can gain a job or a pin while
+    the others are being stopped."""
+    targets = [k for k in plan.replace + plan.evict if k in INSTANCES]
+    blocked = [k for k in targets if not _evictable(k)]
+    if blocked:
+        raise RuntimeError(f"{', '.join(blocked)} became pinned or busy; plan again")
+    EVICTING.update(targets)
+    try:
+        for key in targets:
+            job.detail = f"stopping {key} to make room"
+            await _evict(key)
+    finally:
+        EVICTING.difference_update(targets)
+    return targets
 
 
 def _plan(need: int, protect: set[str], replace: list[str]) -> vram.Plan:
@@ -518,13 +598,7 @@ async def _evict(key: str) -> None:
     if inst is None:
         return
     if inst.engine == "ollama":
-        async with httpx.AsyncClient(timeout=60) as client:
-            with contextlib.suppress(httpx.HTTPError):
-                await client.post(f"{INTERNAL['ollama']}/api/generate", json={"model": inst.model, "keep_alive": 0})
-        for _ in range(30):
-            if not any((m.get("name") or m.get("model")) == inst.model for m in await _ollama_ps()):
-                break
-            await asyncio.sleep(0.5)
+        await _unload_ollama(inst.model)
         STORE.manage(inst.model, False)
     else:
         await asyncio.to_thread(_stop, inst.engine)
@@ -607,25 +681,44 @@ def _start_job(job: Job, work: Any) -> dict[str, Any]:
     return job.view()
 
 
-async def _place(job: Job, inst: Instance, evict: str, replace: list[str], start: Any) -> str:
+def _replacements(engine: Engine, key: str) -> list[str]:
+    """vllm and nemo hold one model: the other one, if any, has to go. Refused if it
+    is pinned, starting or running a job."""
+    if engine not in ("vllm", "nemo"):
+        return []
+    others = [i for i in INSTANCES.values() if i.engine == engine and i.key != key]
+    for other in others:
+        if other.starting or STORE.pinned(other.key) or _jobs_of(other.key) or other.key in EVICTING:
+            raise ToolError(
+                f"{engine} holds {other.model}, which is pinned, starting or running a job; "
+                f"model_down model={other.model} first"
+            )
+    return [o.key for o in others]
+
+
+async def _place(job: Job, inst: Instance, evict: str, start: Any) -> str:
     """Admit inst against the budget, evicting as the plan says if allowed, then
-    start it. Holds PLACEMENT throughout, so the footprint measured around the
-    start is this model's alone when no other job is running."""
+    start it. Holds PLACEMENT throughout: what to replace or evict is decided on
+    the ledger as it is now, and the footprint measured around the start is this
+    model's alone (it is not measured when anything was stopped for it)."""
     async with PLACEMENT:
         job.detail = "waiting for room on the GPU"
         await _reconcile()
-        plan = _plan(inst.vram_mib, {inst.key}, replace)
+        if (existing := INSTANCES.get(inst.key)) is not None:
+            if existing.starting:
+                raise RuntimeError(f"{inst.model} is already starting in another job")
+            job.result = {"already_up": True, "evicted": [], "vram_mib": existing.vram_mib}
+            return f"{inst.model} was already up"
+        plan = _plan(inst.vram_mib, {inst.key}, _replacements(inst.engine, inst.key))
         if not plan.can_fit or (not plan.fits and evict != "auto"):
             job.result = _refusal(plan)
             raise RuntimeError(plan.reason or f"{inst.model} does not fit")
-        evicted = []
-        for key in plan.replace + plan.evict:
-            job.detail = f"stopping {key} to make room"
-            await _evict(key)
-            evicted.append(key)
+        evicted = await _carry_out(job, plan)
         if evicted:
             await _wait_card_free(inst.vram_mib + vram.SAFETY_MIB)
-        quiet = not any(j.state == "running" and j is not job and j.kind != "pull" for j in JOBS.values())
+        quiet = not evicted and not any(
+            j.state == "running" and j is not job and j.kind != "pull" for j in JOBS.values()
+        )
         before = await asyncio.to_thread(vram.smi)
         inst.starting = True
         INSTANCES[inst.key] = inst
@@ -641,8 +734,10 @@ async def _place(job: Job, inst: Instance, evict: str, replace: list[str], start
             await asyncio.sleep(3)
             after = await asyncio.to_thread(vram.smi)
             if after and after["used"] > before["used"]:
-                inst.vram_mib, inst.vram_source = after["used"] - before["used"], "measured"
-                STORE.record(inst.record_key, inst.vram_mib)
+                measured = after["used"] - before["used"]
+                STORE.record(inst.record_key, measured)
+                if inst.vram_source != "declared":  # a declaration stays in charge
+                    inst.vram_mib, inst.vram_source = measured, "measured"
         job.result = {"evicted": evicted, "vram_mib": inst.vram_mib, "vram_source": inst.vram_source}
         return detail
 
@@ -813,9 +908,7 @@ async def _reserve_burst(job: Job, mib: int, evict: str) -> None:
         if not plan.can_fit or (not plan.fits and evict != "auto"):
             job.result = _refusal(plan)
             raise RuntimeError(plan.reason or f"the {mib} MiB this job needs does not fit")
-        for key in plan.evict:
-            job.detail = f"stopping {key} to make room"
-            await _evict(key)
+        await _carry_out(job, plan)
         BURSTS[job.id] = mib
 
 
@@ -980,8 +1073,11 @@ async def model_list(engine: Engine | None = None) -> list[dict[str, Any]]:
         if inst is not None:
             m["vram_mib"], m["vram_source"] = inst.vram_mib, inst.vram_source
         elif m["engine"] == "vllm":
-            cfg = await asyncio.to_thread(_vllm_config, m["model"], None, None, None)
-            m["vram_mib"], m["vram_source"] = cfg["need"], cfg["source"]
+            try:
+                cfg = await asyncio.to_thread(_vllm_config, m["model"], None, None, None)
+                m["vram_mib"], m["vram_source"] = cfg["need"], cfg["source"]
+            except ToolError:  # the defaults do not fit its context; model_up says why
+                m["vram_mib"], m["vram_source"] = None, "too_small"
         else:
             m["vram_mib"], m["vram_source"], _ = await _simple_need(m["engine"], m["model"], None, start_server=False)
     return models
@@ -1005,7 +1101,7 @@ async def model_up(
     model: str,
     max_model_len: int | None = None,
     gpu_memory_utilization: float | None = None,
-    vram_mib: int | None = None,
+    vram_mib: StrictInt | None = None,  # strict: true or "3000" is refused, not coerced
     pin: bool | None = None,
     evict: Evict = "never",
     dry_run: bool = False,
@@ -1016,8 +1112,9 @@ async def model_up(
     does not, nothing happens and the reply is a plan {refused, fits, need_mib,
     free_mib, evict: [...]}; call again with evict="auto" to stop the models in evict
     (least recently used first, never pinned ones or ones running a job). dry_run
-    returns the plan without doing anything. vram_mib declares the need of a model
-    aias has not measured yet. pin=true keeps it from being evicted (false unpins).
+    returns the plan without doing anything. vram_mib (MiB, at most the card) declares
+    the need and wins over aias's own measurement, to correct a wrong one. pin=true
+    keeps it from being evicted (false unpins).
     vllm holds one model: asking for another replaces it. max_model_len and
     gpu_memory_utilization apply to vllm only; left out, they are 8192 and 0.8, or 448
     and 0.4 for a Whisper model. vLLM startup takes 40 s to several minutes; the first
@@ -1029,6 +1126,13 @@ async def model_up(
         _check_nemo_repo(model)
     if engine == "ollama":
         model = _ollama_name(model)
+    total = _total()
+    if vram_mib is not None and (vram_mib <= 0 or (total and vram_mib > total)):
+        raise ToolError(f"vram_mib must be a whole number of MiB from 1 to {total or 'the card size'}, not {vram_mib}")
+    if gpu_memory_utilization is not None and not 0 < gpu_memory_utilization <= 1:
+        raise ToolError(f"gpu_memory_utilization must be above 0 and at most 1, not {gpu_memory_utilization}")
+    if max_model_len is not None and max_model_len <= 0:
+        raise ToolError(f"max_model_len must be positive, not {max_model_len}")
     if engine == "vllm":
         cfg = await asyncio.to_thread(_vllm_config, model, max_model_len, gpu_memory_utilization, vram_mib)
         need, source, record_key = cfg["need"], cfg["source"], cfg["record_key"]
@@ -1041,6 +1145,8 @@ async def model_up(
     if current is not None:
         if current.starting:
             raise ToolError(f"{model} is already starting; follow its model_up job with job_status")
+        if current.key in EVICTING:
+            raise ToolError(f"{model} is being stopped to make room for another model")
         if pin is not None and not dry_run:
             STORE.pin(key, pin)
         if engine == "ollama" and not current.managed and not dry_run:
@@ -1050,16 +1156,8 @@ async def model_up(
         return {"already_up": True, "model": model, "engine": engine, "vram_mib": current.vram_mib,
                 "pinned": STORE.pinned(key)}
 
-    replace: list[str] = []
-    if engine in ("vllm", "nemo"):
-        for other in [i for i in INSTANCES.values() if i.engine == engine]:
-            if STORE.pinned(other.key) or _jobs_of(other.key) or other.starting:
-                raise ToolError(
-                    f"{engine} holds {other.model}, which is pinned, starting or running a job; "
-                    f"model_down model={other.model} first"
-                )
-            replace.append(other.key)
-    plan = _plan(need, {key}, replace)
+    # A preview for the reply; the job decides again once it holds PLACEMENT.
+    plan = _plan(need, {key}, _replacements(engine, key))
     if dry_run:
         return {"dry_run": True, "model": model, "engine": engine, "vram_source": source, **plan.view()}
     if not plan.can_fit or (not plan.fits and evict != "auto"):
@@ -1069,7 +1167,7 @@ async def model_up(
     start = _start_ollama if engine == "ollama" else _start_nemo if engine == "nemo" else _start_vllm(cfg)
 
     async def work(job: Job) -> str:
-        detail = await _place(job, inst, evict, replace, start)
+        detail = await _place(job, inst, evict, start)
         if pin:
             STORE.pin(key, True)
         return detail
@@ -1089,38 +1187,79 @@ def _cancel(jobs: list[Job]) -> list[asyncio.Task]:
     return tasks
 
 
+def _stop_if_running(engine: Engine, names: set[str]) -> bool:
+    """Stop the vllm or nemo container if it runs one of names. The check and the
+    stop share the compose lock, so an up still finishing in a cancelled job's
+    thread completes first and is then seen."""
+    with _COMPOSE_LOCK:
+        if engine not in _running():
+            return False
+        running = _vllm_model_from_container() if engine == "vllm" else _nemo_model_from_container()
+        if running not in names:
+            return False
+        _stop(engine)
+        return True
+
+
+async def _unload_ollama(name: str) -> None:
+    async with httpx.AsyncClient(timeout=60) as client:
+        with contextlib.suppress(httpx.HTTPError):
+            await client.post(f"{INTERNAL['ollama']}/api/generate", json={"model": name, "keep_alive": 0})
+    for _ in range(30):
+        if not any((m.get("name") or m.get("model")) == name for m in await _ollama_ps()):
+            return
+        await asyncio.sleep(0.5)
+
+
 @mcp.tool()
 async def model_down(model: str | None = None) -> dict[str, Any]:
     """Stop models and free their GPU memory. With model, stop only that one (pinned or
-    not) and cancel only its jobs. Without, stop every engine and cancel every pull, up,
-    diarize or transcribe job, as before."""
+    not, loaded or still starting) and cancel only its jobs. Without, stop every engine
+    and cancel every pull, up, diarize or transcribe job, as before."""
     _ensure_reconciler()
     if model is None:
         tasks = _cancel([j for j in JOBS.values() if j.state == "running"])
         _cancel_build()
         if tasks:
             await asyncio.wait(tasks, timeout=30)
-        await asyncio.to_thread(_stop, *ENGINES)
-        for inst in list(INSTANCES.values()):
-            STORE.pin(inst.key, False)
-            if inst.engine == "ollama":
-                STORE.manage(inst.model, False)
-        INSTANCES.clear()
-        BURSTS.clear()
-        CARD["smi"] = await asyncio.to_thread(vram.smi)
+        # No reconcile may read the containers mid-stop and put a model back.
+        async with _RECONCILE_LOCK:
+            await asyncio.to_thread(_stop, *ENGINES)
+            for inst in list(INSTANCES.values()):
+                STORE.pin(inst.key, False)
+                if inst.engine == "ollama":
+                    STORE.manage(inst.model, False)
+            INSTANCES.clear()
+            BURSTS.clear()
+            CARD["smi"] = await asyncio.to_thread(vram.smi)
         return {"stopped": list(ENGINES), "gpu": _gpu_view()}
-    await _reconcile()
+
     names = {model, _ollama_name(model)}
-    targets = [i for i in INSTANCES.values() if i.model in names]
-    if not targets:
-        raise ToolError(f"{model} is not up; status lists what is")
-    tasks = _cancel([j for j in JOBS.values() if j.state == "running" and j.instance in {i.key for i in targets}])
+    jobs = [j for j in JOBS.values() if j.state == "running" and j.kind != "pull" and j.model in names]
+    tasks = _cancel(jobs)
     if tasks:
         await asyncio.wait(tasks, timeout=30)
-    for inst in targets:
-        await _evict(inst.key)
-    CARD["smi"] = await asyncio.to_thread(vram.smi)
-    return {"stopped": [i.key for i in targets], "gpu": _gpu_view()}
+    stopped: list[str] = []
+    async with _RECONCILE_LOCK:
+        # Go by what the engines run, not the ledger: a model still starting (or
+        # one whose job was just cancelled) may have no ledger entry.
+        for engine in ("vllm", "nemo"):
+            if await asyncio.to_thread(_stop_if_running, engine, names):
+                stopped.append(f"{engine}:{model}")
+        loaded = {(m.get("name") or m.get("model")) for m in await _ollama_ps()}
+        for name in names & loaded:
+            await _unload_ollama(name)
+            STORE.manage(name, False)
+            stopped.append(f"ollama:{name}")
+        for inst in [i for i in INSTANCES.values() if i.model in names]:
+            INSTANCES.pop(inst.key, None)
+            STORE.pin(inst.key, False)
+            if inst.key not in stopped:
+                stopped.append(inst.key)
+        CARD["smi"] = await asyncio.to_thread(vram.smi)
+    if not stopped and not jobs:
+        raise ToolError(f"{model} is not up; status lists what is")
+    return {"stopped": stopped, "cancelled_jobs": [j.id for j in jobs], "gpu": _gpu_view()}
 
 
 def _gpu_view() -> dict[str, Any] | None:
@@ -1150,6 +1289,8 @@ async def diarize(audio_url: str, mode: Mode = "offline", evict: Evict = "never"
     inst = _up_instance("nemo", lambda m: True)
     if inst is None:
         raise ToolError("nemo is not up: run model_up engine=nemo model=nvidia/Nemotron-3-Diarization first")
+    if inst.key in EVICTING:
+        raise ToolError(f"{inst.model} is being stopped to make room for another model")
     job = Job("diarize", "nemo", inst.model, instance=inst.key)
     inst.last_used = time.time()
     return _start_job(job, lambda j: _diarize(j, audio_url, mode, evict))
@@ -1172,6 +1313,8 @@ async def transcribe(audio_url: str, language: str = "zh", traditional: bool = T
         raise ToolError(
             "no Whisper model is up: run model_up engine=vllm model=openai/whisper-large-v3 first"
         )
+    if inst.key in EVICTING:
+        raise ToolError(f"{inst.model} is being stopped to make room for another model")
     if not await _wait_http(f"{INTERNAL['vllm']}/v1/models", 0.1):
         raise ToolError(f"{inst.model} is still starting; wait for its model_up job to finish")
     inst.last_used = time.time()
