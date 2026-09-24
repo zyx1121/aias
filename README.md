@@ -76,9 +76,15 @@ Any other MCP client:
 
 ## Diarization
 
-The nemo engine runs [nvidia/Nemotron-3-Diarization](https://huggingface.co/nvidia/Nemotron-3-Diarization), a 100M parameter streaming Sortformer that labels up to 8 speakers, overlaps included. The first `model_up` with `engine: "nemo"` builds its image (about 11 GB, 5 minutes); later starts take about 30 s.
+The nemo engine runs [nvidia/Nemotron-3-Diarization](https://huggingface.co/nvidia/Nemotron-3-Diarization), a 100M parameter streaming Sortformer that labels up to 8 speakers, overlaps included. The first `model_up` with `engine: "nemo"` builds its image (about 11 GB, 5 minutes); later starts reuse the build cache and take about 30 s, and an upgrade that changed the engine rebuilds it. nemo loads only Hugging Face repos under `nvidia/`, because a `.nemo` archive can carry code.
 
-`diarize` downloads `audio_url` on the server (http or https, any format ffmpeg reads, up to 2 GB), resamples it to 16 kHz mono, and returns a job. The finished job's `result` holds:
+`diarize` downloads `audio_url` on the server, resamples it to 16 kHz mono, and returns a job. Limits:
+
+- http or https, any format ffmpeg reads, up to 2 GB and 10 minutes of download
+- up to 2 hours of audio, so offline mode fits in 10 GB of GPU memory
+- the host, and every redirect, must resolve to a public address: private, loopback and link-local addresses are refused
+
+The finished job's `result` holds:
 
 | Field | Meaning |
 |-------|---------|
@@ -113,7 +119,7 @@ nemo has no port of its own: only the MCP server talks to it.
 
 - NVIDIA only: vLLM and the container toolkit need CUDA.
 - One model at a time: a consumer GPU cannot hold two. The diarization model counts as one.
-- `diarize` takes a URL, not a local file: put the file behind any http server the WSL distro can reach.
+- `diarize` takes a public URL, not a local file or a LAN address: upload the recording somewhere reachable from the internet first.
 - Docker must not run in another WSL distro at the same time, because all WSL2 distros share one network namespace. Setup checks and stops if it does.
 - Unsigned installer: Windows SmartScreen asks before it runs.
 

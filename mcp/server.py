@@ -39,7 +39,12 @@ PUBLIC = {"ollama": "http://127.0.0.1:11434/v1", "vllm": "http://127.0.0.1:8000/
 OLLAMA_MANIFESTS = Path("/ollama/models/manifests")
 VLLM_STARTUP_SECS = 900
 NEMO_STARTUP_SECS = 600
-NEMO_IMAGE = "aias-nemo:local"
+NEMO_BUILD_SECS = 3600
+# nemo loads .nemo archives, which can carry pickled code: only NVIDIA's repos.
+NEMO_REPO_PREFIX = "nvidia/"
+# One diarize call end to end: the engine caps the download at 10 minutes and
+# the audio at 2 hours, which ultralow mode needs about 25 minutes for.
+DIARIZE_SECS = 3600
 
 mcp = MCPServer(
     "aias",
@@ -60,13 +65,18 @@ mcp = MCPServer(
 
 
 _NO_LOCK = contextlib.nullcontext()
-# Serializes compose calls that start or stop containers. A cancelled job's
-# `up` keeps running in its worker thread, so a later `stop` must wait for it.
+# Serializes compose calls that build, start or stop containers. A cancelled
+# job's `up` keeps running in its worker thread, so a later `stop` must wait for it.
 _COMPOSE_LOCK = threading.Lock()
+# The nemo image build in progress, so model_down can end it instead of
+# waiting minutes for the lock.
+_BUILD: subprocess.Popen[str] | None = None
+# Set by model_down so a build still waiting for the lock never starts.
+_BUILD_CANCELLED = threading.Event()
 
 
 def _run(*args: str, env: dict[str, str] | None = None, timeout: float = 600) -> str:
-    mutating = args[0] in ("up", "stop")
+    mutating = args[0] in ("up", "stop", "build")
     with _COMPOSE_LOCK if mutating else _NO_LOCK:
         proc = subprocess.run(
             [*COMPOSE, *args],
@@ -131,6 +141,34 @@ def _gpu() -> dict[str, Any] | None:
         return None
     name, used, total = (x.strip() for x in out.stdout.splitlines()[0].split(","))
     return {"name": name, "memory_used_mib": int(used), "memory_total_mib": int(total)}
+
+
+def _build_nemo() -> None:
+    """Build the nemo image. Runs on every model_up: an unchanged nemo/ is a cache
+    hit in seconds, and a changed one (after an upgrade) gets rebuilt."""
+    global _BUILD
+    with _COMPOSE_LOCK:
+        if _BUILD_CANCELLED.is_set():
+            raise RuntimeError("nemo image build cancelled by model_down")
+        proc = subprocess.Popen(
+            [*COMPOSE, "build", "nemo"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+        _BUILD = proc
+        try:
+            out, _ = proc.communicate(timeout=NEMO_BUILD_SECS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, _ = proc.communicate()
+        finally:
+            _BUILD = None
+    if proc.returncode != 0:
+        raise RuntimeError(f"building the nemo image failed (exit {proc.returncode}): {out.strip()[-2000:]}")
+
+
+def _cancel_build() -> None:
+    _BUILD_CANCELLED.set()
+    if (proc := _BUILD) is not None and proc.poll() is None:
+        proc.terminate()
 
 
 def _stop(*services: str) -> None:
@@ -250,7 +288,8 @@ def _start_job(job: Job, work: Any) -> dict[str, Any]:
             job.detail = "cancelled by model_down"
         except Exception as exc:  # reported through job_status
             job.state = "error"
-            job.detail = str(exc)[-3000:]
+            # Some exceptions (httpx timeouts) carry no message.
+            job.detail = (str(exc) or type(exc).__name__)[-3000:]
         finally:
             job.finished = time.time()
 
@@ -349,15 +388,16 @@ async def _up_vllm(job: Job, max_model_len: int, gpu_memory_utilization: float) 
     raise RuntimeError(f"vLLM did not become ready. Last log lines:\n{tail}")
 
 
-def _nemo_image_exists() -> bool:
-    return subprocess.run(["docker", "image", "inspect", NEMO_IMAGE], capture_output=True).returncode == 0
+def _check_nemo_repo(model: str) -> None:
+    if not model.startswith(NEMO_REPO_PREFIX):
+        raise ToolError(f"nemo only loads Hugging Face repos under {NEMO_REPO_PREFIX}, not {model}")
 
 
 async def _up_nemo(job: Job) -> str:
     await asyncio.to_thread(_stop, *_others("nemo"))
-    if not await asyncio.to_thread(_nemo_image_exists):
-        job.detail = "building the nemo image (first time only, about 5 minutes)"
-        await asyncio.to_thread(_run, "build", "nemo", timeout=3600)
+    job.detail = "building the nemo image (about 5 minutes the first time, seconds after)"
+    _BUILD_CANCELLED.clear()
+    await asyncio.to_thread(_build_nemo)
     await asyncio.to_thread(_run, "up", "-d", "--force-recreate", "nemo", env={"NEMO_MODEL": job.model})
     job.detail = "loading the model onto the GPU"
 
@@ -372,8 +412,16 @@ async def _up_nemo(job: Job) -> str:
 
 async def _diarize(job: Job, audio_url: str, mode: str) -> str:
     job.detail = f"downloading and diarizing ({mode})"
-    async with httpx.AsyncClient(timeout=httpx.Timeout(3600, connect=10)) as client:
-        resp = await client.post(f"{INTERNAL['nemo']}/diarize", json={"audio_url": audio_url, "mode": mode})
+    try:
+        async with asyncio.timeout(DIARIZE_SECS):
+            async with httpx.AsyncClient(timeout=httpx.Timeout(DIARIZE_SECS, connect=10)) as client:
+                resp = await client.post(
+                    f"{INTERNAL['nemo']}/diarize", json={"audio_url": audio_url, "mode": mode}
+                )
+    except TimeoutError:
+        raise RuntimeError(f"diarize did not finish within {DIARIZE_SECS} s") from None
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"could not reach the nemo engine: {type(exc).__name__} {exc}".rstrip()) from exc
     try:
         body = resp.json()
     except ValueError:
@@ -445,6 +493,8 @@ async def model_pull(engine: Engine, model: str) -> dict[str, Any]:
     """Download a model. ollama takes library names like qwen3:8b; vllm and nemo take Hugging
     Face repo ids like Qwen/Qwen3-0.6B or nvidia/Nemotron-3-Diarization. Returns a job;
     poll job_status."""
+    if engine == "nemo":
+        _check_nemo_repo(model)
     work = _pull_ollama if engine == "ollama" else _pull_hf
     return _start_job(Job("pull", engine, model), work)
 
@@ -464,6 +514,7 @@ async def model_up(
     if engine == "ollama":
         return _start_job(job, _up_ollama)
     if engine == "nemo":
+        _check_nemo_repo(model)
         return _start_job(job, _up_nemo)
     return _start_job(job, lambda j: _up_vllm(j, max_model_len, gpu_memory_utilization))
 
@@ -473,6 +524,8 @@ async def model_down() -> dict[str, Any]:
     """Stop every engine and free the GPU. Cancels a pull, up or diarize job that is still running."""
     if (job := _busy()) is not None and job.task is not None:
         job.task.cancel()
+        # A build holds the compose lock for minutes; end it so _stop gets the lock.
+        _cancel_build()
         await asyncio.wait({job.task}, timeout=30)
     await asyncio.to_thread(_stop, *ENGINES)
     return {"stopped": list(ENGINES), "gpu": await asyncio.to_thread(_gpu)}
