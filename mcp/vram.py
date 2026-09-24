@@ -24,6 +24,15 @@ DESKTOP_RESERVE_MIB = int(os.environ.get("AIAS_DESKTOP_RESERVE_MIB", "1024"))
 SAFETY_MIB = int(os.environ.get("AIAS_SAFETY_MIB", "512"))
 # An Ollama runner's CUDA context on top of the size_vram it reports.
 OLLAMA_OVERHEAD_MIB = 250
+# Ollama's context and KV cache type; keep in step with the ollama service.
+OLLAMA_NUM_CTX = int(os.environ.get("AIAS_OLLAMA_NUM_CTX", "32768"))
+OLLAMA_NUM_PARALLEL = int(os.environ.get("AIAS_OLLAMA_NUM_PARALLEL", "1"))
+OLLAMA_KV_TYPE = os.environ.get("AIAS_OLLAMA_KV_CACHE_TYPE", "q8_0")
+# Bytes per cached element; q8_0 and q4_0 store a 2 byte scale per 32 values.
+KV_BYTES = {"f16": 2.0, "q8_0": 34 / 32, "q4_0": 18 / 32}
+# Without model metadata: the weights twice over, or the weights + 2 GiB.
+OLLAMA_FALLBACK_FACTOR = 2.0
+OLLAMA_FALLBACK_MIN_EXTRA_MIB = 2048
 # nemo with the model loaded and no job, at the nvidia-smi level.
 NEMO_BASE_MIB = int(os.environ.get("AIAS_NEMO_BASE_MIB", "1300"))
 # Offline diarization peaks about 36 MiB per minute of audio; until a run has
@@ -54,6 +63,36 @@ def smi() -> dict[str, Any] | None:
 
 def budget(total_mib: int) -> int:
     return total_mib - DESKTOP_RESERVE_MIB - SAFETY_MIB
+
+
+def ollama_kv_mib(model_info: dict[str, Any]) -> int | None:
+    """KV cache of an Ollama model at OLLAMA_NUM_CTX, from /api/show's model_info
+    (GGUF metadata). None if the fields are missing."""
+    arch = model_info.get("general.architecture")
+    get = lambda name: model_info.get(f"{arch}.{name}")  # noqa: E731
+    layers, heads = get("block_count"), get("attention.head_count")
+    kv_heads = get("attention.head_count_kv") or heads
+    if not (arch and layers and kv_heads):
+        return None
+    head_dim = get("attention.key_length") or (
+        get("embedding_length") // heads if get("embedding_length") and heads else None
+    )
+    value_dim = get("attention.value_length") or head_dim
+    if not head_dim:
+        return None
+    ctx = min(OLLAMA_NUM_CTX, get("context_length") or OLLAMA_NUM_CTX) * OLLAMA_NUM_PARALLEL
+    per_token = layers * kv_heads * (head_dim + value_dim) * KV_BYTES.get(OLLAMA_KV_TYPE, 2.0)
+    return round(ctx * per_token / 2**20)
+
+
+def ollama_estimate_mib(file_mib: int, model_info: dict[str, Any] | None) -> tuple[int, bool]:
+    """(need, used the metadata) for an Ollama model that has not been loaded yet:
+    weights + KV cache + runner overhead, or a conservative multiple."""
+    kv = ollama_kv_mib(model_info or {})
+    if kv is not None:
+        return file_mib + kv + OLLAMA_OVERHEAD_MIB, True
+    extra = max(file_mib * (OLLAMA_FALLBACK_FACTOR - 1), OLLAMA_FALLBACK_MIN_EXTRA_MIB)
+    return round(file_mib + extra) + OLLAMA_OVERHEAD_MIB, False
 
 
 def nemo_burst_mib(audio_s: float, measured_per_min: float | None = None) -> int:
@@ -189,18 +228,27 @@ def make_plan(
         card = smi_free_mib is None or smi_free_mib + freed >= need_mib + SAFETY_MIB
         return ledger and card
 
-    freed = sum(c.mib for c in replace)
-    plan.fits = ok(freed)
+    base = sum(c.mib for c in replace)
+    plan.fits = ok(base)
     if plan.fits:
         plan.can_fit = True
         return plan
+    # Take candidates least recently used first until it fits, then walk back
+    # from the most recent one taken and drop any the rest can do without. The
+    # result is minimal and still leans on the models idle the longest.
+    chosen: list[Candidate] = []
     for cand in sorted(candidates, key=lambda c: c.last_used):
-        plan.evict.append(cand.key)
-        freed += cand.mib
-        if ok(freed):
-            plan.can_fit = True
-            plan.reason = f"fits after evicting {', '.join(plan.evict)}; pass evict=\"auto\" to do it"
-            return plan
-    plan.evict = []
-    plan.reason = "does not fit even after evicting every model that is not pinned and has no job"
+        chosen.append(cand)
+        if ok(base + sum(c.mib for c in chosen)):
+            break
+    else:
+        plan.reason = "does not fit even after evicting every model that is not pinned and has no job"
+        return plan
+    for cand in reversed(chosen[:]):
+        rest = [c for c in chosen if c is not cand]
+        if ok(base + sum(c.mib for c in rest)):
+            chosen = rest
+    plan.evict = [c.key for c in chosen]
+    plan.can_fit = True
+    plan.reason = f"fits after evicting {', '.join(plan.evict)}; pass evict=\"auto\" to do it"
     return plan

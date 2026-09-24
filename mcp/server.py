@@ -349,7 +349,22 @@ def _vllm_config(
     return {"max_len": max_len, "kv": kv, "record_key": key, "need": need, "source": source}
 
 
-def _simple_need(engine: str, model: str, vram_mib: int | None) -> tuple[int, str, str]:
+async def _ollama_model_info(model: str, start_server: bool) -> dict[str, Any] | None:
+    """GGUF metadata from /api/show. Starting the server for it costs no GPU memory."""
+    if start_server:
+        with contextlib.suppress(RuntimeError):
+            await _ensure_ollama_server()
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(f"{INTERNAL['ollama']}/api/show", json={"model": model})
+        return resp.json().get("model_info") if resp.status_code == 200 else None
+    except (httpx.HTTPError, ValueError):
+        return None
+
+
+async def _simple_need(
+    engine: str, model: str, vram_mib: int | None, start_server: bool = True
+) -> tuple[int, str, str]:
     """(need, source, record key) for ollama and nemo."""
     key = f"{engine}:{model}"
     if measured := STORE.measured(key):
@@ -358,8 +373,10 @@ def _simple_need(engine: str, model: str, vram_mib: int | None) -> tuple[int, st
         return vram_mib, "declared", key
     if engine == "nemo":
         return vram.NEMO_BASE_MIB, "estimate", key
-    disk = _disk_mib("ollama", model)
-    return (disk or 1024) + vram.OLLAMA_OVERHEAD_MIB, "estimate", key
+    disk = await asyncio.to_thread(_disk_mib, "ollama", model) or 1024
+    info = await _ollama_model_info(model, start_server)
+    need, _ = vram.ollama_estimate_mib(disk, info)
+    return need, "estimate", key
 
 
 async def _ollama_ps() -> list[dict[str, Any]]:
@@ -392,7 +409,7 @@ async def _sync_single(engine: Engine, running: dict[str, Any]) -> None:
     else:
         if not (model := await asyncio.to_thread(_nemo_model_from_container)):
             return
-        need, source, key = _simple_need("nemo", model, None)
+        need, source, key = await _simple_need("nemo", model, None)
     INSTANCES[f"{engine}:{model}"] = Instance(engine, model, need, source, key)
 
 
@@ -966,7 +983,7 @@ async def model_list(engine: Engine | None = None) -> list[dict[str, Any]]:
             cfg = await asyncio.to_thread(_vllm_config, m["model"], None, None, None)
             m["vram_mib"], m["vram_source"] = cfg["need"], cfg["source"]
         else:
-            m["vram_mib"], m["vram_source"], _ = await asyncio.to_thread(_simple_need, m["engine"], m["model"], None)
+            m["vram_mib"], m["vram_source"], _ = await _simple_need(m["engine"], m["model"], None, start_server=False)
     return models
 
 
@@ -1017,7 +1034,7 @@ async def model_up(
         need, source, record_key = cfg["need"], cfg["source"], cfg["record_key"]
     else:
         cfg = {}
-        need, source, record_key = await asyncio.to_thread(_simple_need, engine, model, vram_mib)
+        need, source, record_key = await _simple_need(engine, model, vram_mib)
     key = f"{engine}:{model}"
 
     current = INSTANCES.get(key)

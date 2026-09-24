@@ -93,12 +93,12 @@ The ledger decides, not nvidia-smi: under WSL an overcommitted card does not fai
 | any model | a measurement: nvidia-smi before and after its first start with no other job running, kept in the `aias-state` volume |
 | any model | `vram_mib` passed to `model_up` |
 | vLLM | `gpu_memory_utilization` x card: 0.4 for Whisper, 0.8 otherwise |
-| Ollama | what `/api/ps` reports once loaded, + 250 MiB; before that the model file + 250 MiB |
+| Ollama | what `/api/ps` reports once loaded, + 250 MiB; before that the model file + its KV cache at the 32k context (layers, KV heads and head size from `/api/show`) + 250 MiB, or twice the file if the metadata is missing |
 | nemo | 1300 MiB, plus a per-file reservation during `diarize`: the highest measured MiB per minute of audio (about 39), or 43 before the first run |
 
 vLLM normally sizes its KV cache from whatever is free on the card, so next to another engine it would take a different amount each time. aias passes `--kv-cache-memory` instead (450 MB for Whisper; for other models the budget left after the weights and 1.5 GiB of overhead), so an instance takes what it was budgeted for.
 
-When a model does not fit, `model_up` changes nothing and returns `{refused, fits, need_mib, free_mib, evict}`. `evict` lists the least recently used models that would have to stop, never pinned ones or ones running a job; pass `evict: "auto"` to stop them. If even that is not enough, `evict` is empty and the reason says so. vLLM and nemo hold one model each, so asking for a different one replaces it (unless it is pinned or busy).
+When a model does not fit, `model_up` changes nothing and returns `{refused, fits, need_mib, free_mib, evict}`. `evict` is the smallest set of models to stop, preferring those idle the longest, never pinned ones or ones running a job; pass `evict: "auto"` to stop exactly those. If even that is not enough, `evict` is empty and the reason says so. vLLM and nemo hold one model each, so asking for a different one replaces it (unless it is pinned or busy).
 
 Every 10 s aias compares nvidia-smi with the ledger. If more is in use than the ledger and the desktop reserve explain, `status` shows `pressure: true` and new models are refused until it clears; nothing running is stopped. `over_budget` means clients loaded more into Ollama directly than the budget allows, and `cpu_offload` on an Ollama model means Ollama itself put part of it in system memory.
 

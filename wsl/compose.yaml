@@ -4,6 +4,11 @@
 # against a VRAM budget so several share the card.
 name: aias
 
+# Ollama's context and KV cache type, shared with the MCP server, which sizes
+# a model's KV cache from them before it is first loaded.
+x-ollama-num-ctx: &ollama-num-ctx "32768"
+x-ollama-kv-type: &ollama-kv-type q8_0
+
 services:
   mcp:
     build: ./mcp
@@ -17,6 +22,8 @@ services:
       # VRAM budget = card - desktop reserve - safety margin (mcp/vram.py).
       AIAS_DESKTOP_RESERVE_MIB: ${AIAS_DESKTOP_RESERVE_MIB:-1024}
       AIAS_SAFETY_MIB: ${AIAS_SAFETY_MIB:-512}
+      AIAS_OLLAMA_NUM_CTX: *ollama-num-ctx
+      AIAS_OLLAMA_KV_CACHE_TYPE: *ollama-kv-type
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /opt/aias:/opt/aias:ro
@@ -33,9 +40,9 @@ services:
     volumes:
       - ollama:/root/.ollama
     environment:
-      OLLAMA_CONTEXT_LENGTH: "32768"
+      OLLAMA_CONTEXT_LENGTH: *ollama-num-ctx
       OLLAMA_FLASH_ATTENTION: "1"
-      OLLAMA_KV_CACHE_TYPE: q8_0
+      OLLAMA_KV_CACHE_TYPE: *ollama-kv-type
       # aias decides what fits; Ollama must not unload models on its own count.
       OLLAMA_MAX_LOADED_MODELS: "16"
 
