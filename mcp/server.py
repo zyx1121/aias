@@ -3,8 +3,8 @@ transcribe audio.
 
 Runs in a container next to the engines and drives them through the Docker
 socket with the same compose file a person would use by hand. Several models
-share the card: one Ollama server (any number of models), one vLLM model and
-one nemo model, admitted against a VRAM budget (vram.py).
+share the card: one Ollama server (any number of models), up to 10 vLLM models
+(one container and port each) and one nemo model, admitted against a VRAM budget (vram.py).
 """
 
 from __future__ import annotations
@@ -47,10 +47,16 @@ Evict = Literal["never", "auto"]
 
 COMPOSE = ["docker", "compose", "-f", os.environ.get("AIAS_COMPOSE", "/opt/aias/compose.yaml")]
 PORT = 11400
-# Inside the compose network the engines answer on their service names.
-INTERNAL = {"ollama": "http://ollama:11434", "vllm": "http://vllm:8000", "nemo": "http://nemo:8100"}
+# Inside the compose network the engines answer on their service names; each
+# vLLM model is its own container, named by its port (VLLM_PORTS).
+INTERNAL = {"ollama": "http://ollama:11434", "nemo": "http://nemo:8100"}
 # What a client on the Windows host uses. nemo has no port; diarize reaches it.
-PUBLIC = {"ollama": "http://127.0.0.1:11434/v1", "vllm": "http://127.0.0.1:8000/v1"}
+PUBLIC = {"ollama": "http://127.0.0.1:11434/v1"}
+# One port per vLLM model, lowest free first, so a lone model is on 8000 as before.
+VLLM_PORTS = range(8000, 8010)
+# Labels on vLLM containers are the truth about them: `compose stop` does not
+# reach containers made by `compose run`, and an MCP restart rebuilds from them.
+LABEL = "aias"
 OLLAMA_MANIFESTS = Path("/ollama/models/manifests")
 VLLM_STARTUP_SECS = 900
 NEMO_STARTUP_SECS = 600
@@ -94,7 +100,7 @@ mcp = MCPServer(
         "Local model host on one NVIDIA GPU. Three engines: ollama (names like qwen3:8b), "
         "vllm (Hugging Face ids like Qwen/Qwen3-0.6B, or openai/whisper-large-v3 for speech "
         "to text) and nemo, speaker diarization (nvidia/Nemotron-3-Diarization). Models "
-        "share the card within a VRAM budget: any number of ollama models, one vllm model "
+        "share the card within a VRAM budget: any number of ollama models, up to 10 vllm models "
         "and one nemo model at a time. model_up refuses a model that does not fit and "
         "returns a plan (fits, need_mib, free_mib, evict); pass evict=\"auto\" to stop the "
         "least recently used models in that plan, dry_run=true to only see it, and "
@@ -124,7 +130,7 @@ _BUILD_CANCELLED = threading.Event()
 
 
 def _run(*args: str, env: dict[str, str] | None = None, timeout: float = 600) -> str:
-    mutating = args[0] in ("up", "stop", "build")
+    mutating = args[0] in ("up", "stop", "build", "run")
     with _COMPOSE_LOCK if mutating else _NO_LOCK:
         proc = subprocess.run(
             [*COMPOSE, *args],
@@ -148,7 +154,12 @@ def _running() -> dict[str, dict[str, Any]]:
             continue
         parsed = json.loads(line)
         rows.extend(parsed if isinstance(parsed, list) else [parsed])
-    return {r["Service"]: r for r in rows if r.get("State") == "running"}
+    # `compose run` containers (the vLLM models) show up as the vllm service too;
+    # they are tracked by their labels instead.
+    return {
+        r["Service"]: r for r in rows
+        if r.get("State") == "running" and "com.docker.compose.oneoff=True" not in (r.get("Labels") or "")
+    }
 
 
 def _inspect(container: str, fmt: str) -> list[str]:
@@ -158,18 +169,37 @@ def _inspect(container: str, fmt: str) -> list[str]:
     return json.loads(out.stdout or "[]") or []
 
 
-def _vllm_args_from_container() -> dict[str, str]:
-    """--model, --max-model-len and --kv-cache-memory of the running vLLM."""
-    args = {}
-    for arg in _inspect("aias-vllm-1", "{{json .Args}}"):
-        if arg.startswith("--") and "=" in arg:
-            key, value = arg[2:].split("=", 1)
-            args[key] = value
-    return args
+def _vllm_name(port: int) -> str:
+    return f"aias-vllm-{port}"
 
 
-def _vllm_model_from_container() -> str | None:
-    return _vllm_args_from_container().get("model")
+def _vllm_url(port: int) -> str:
+    return f"http://{_vllm_name(port)}:8000"
+
+
+def _vllm_containers() -> list[dict[str, Any]]:
+    """Every vLLM container aias made, running or not: name, state and labels."""
+    ids = subprocess.run(
+        ["docker", "ps", "-aq", "--filter", f"label={LABEL}.engine=vllm"], capture_output=True, text=True
+    ).stdout.split()
+    if not ids:
+        return []
+    out = subprocess.run(["docker", "inspect", *ids], capture_output=True, text=True)
+    rows = []
+    for c in json.loads(out.stdout or "[]"):
+        labels = c.get("Config", {}).get("Labels") or {}
+        rows.append({
+            "name": c.get("Name", "").lstrip("/"),
+            "running": c.get("State", {}).get("Running", False),
+            "labels": {k[len(LABEL) + 1:]: v for k, v in labels.items() if k.startswith(f"{LABEL}.")},
+        })
+    return rows
+
+
+def _remove_vllm(names: list[str]) -> None:
+    if names:
+        with _COMPOSE_LOCK:
+            subprocess.run(["docker", "rm", "-f", *names], capture_output=True, text=True, timeout=120)
 
 
 def _nemo_model_from_container() -> str | None:
@@ -339,6 +369,17 @@ class Instance:
     managed: bool = True  # False: an Ollama model a client loaded, not aias
     cpu_offload: bool = False  # Ollama put part of it in system memory
     since: float = field(default_factory=time.time)  # created or last started
+    port: int | None = None  # vLLM only
+
+    @property
+    def url(self) -> str:
+        return _vllm_url(self.port) if self.engine == "vllm" and self.port else INTERNAL[self.engine]
+
+    @property
+    def base_url(self) -> str | None:
+        if self.engine == "vllm":
+            return f"http://127.0.0.1:{self.port}/v1" if self.port else None
+        return PUBLIC.get(self.engine)
 
     def settled(self) -> bool:
         return not self.starting and time.time() - self.since > SETTLE_SECS
@@ -440,8 +481,38 @@ async def _ollama_ps() -> list[dict[str, Any]]:
         return []
 
 
+async def _sync_vllm() -> None:
+    """Match the ledger to the vLLM containers aias labelled, which may have been
+    stopped or have crashed without aias, or outlived an MCP restart."""
+    rows = [r for r in await asyncio.to_thread(_vllm_containers) if r["running"]]
+    live = {}
+    for r in rows:
+        lab = r["labels"]
+        model, port = lab.get("model"), lab.get("port", "")
+        if model and port.isdigit():
+            live[f"vllm:{model}"] = (model, int(port), lab)
+    for key, inst in list(INSTANCES.items()):
+        if inst.engine == "vllm" and key not in live and inst.settled():
+            del INSTANCES[key]
+    for key, (model, port, lab) in live.items():
+        inst = INSTANCES.get(key)
+        if inst is not None:
+            if not inst.starting:
+                inst.port = port
+            continue
+        # The labels carry what the ledger booked at start, declaration included.
+        record_key = lab.get("record_key", f"vllm:{model}")
+        booked, source = int(lab.get("vram_mib", "0") or 0), lab.get("vram_source", "estimate")
+        measured = STORE.measured(record_key)
+        if measured and source != "declared":
+            booked, source = measured, "measured"
+        if booked <= 0:
+            continue
+        INSTANCES[key] = Instance("vllm", model, booked, source, record_key, port=port)
+
+
 async def _sync_single(engine: Engine, running: dict[str, Any]) -> None:
-    """Match the ledger to the vllm or nemo container, which may have been started,
+    """Match the ledger to the nemo container, which may have been started,
     stopped or have crashed without aias (or before an MCP restart)."""
     inst = next((i for i in INSTANCES.values() if i.engine == engine), None)
     if engine not in running:
@@ -450,24 +521,10 @@ async def _sync_single(engine: Engine, running: dict[str, Any]) -> None:
         return
     if inst is not None and inst.starting:
         return
-    if engine == "vllm":
-        args = await asyncio.to_thread(_vllm_args_from_container)
-        model = args.get("model")
-    else:
-        model = await asyncio.to_thread(_nemo_model_from_container)
+    model = await asyncio.to_thread(_nemo_model_from_container)
     if not model:
         return
-    if engine == "vllm":
-        key = f"vllm:{model}:{args.get('max-model-len')}:{args.get('kv-cache-memory')}"
-        util = float(args.get("gpu-memory-utilization", 0) or 0)
-        need, source = STORE.measured(key), "measured"
-        if not need:
-            if not _total():
-                return  # no card size yet: an estimate would be 0; try next round
-            # aias starts vLLM with util = its budgeted need / card.
-            need, source = round(util * _total()), "estimate"
-    else:
-        need, source, key = await _simple_need("nemo", model, None)
+    need, source, key = await _simple_need("nemo", model, None)
     if inst is not None:
         if inst.model == model:
             if inst.vram_source == "estimate" and (inst.vram_mib, inst.record_key) != (need, key):
@@ -517,7 +574,7 @@ async def _reconcile_once() -> None:
     if card:
         CARD["smi"] = card
     running = await asyncio.to_thread(_running)
-    await _sync_single("vllm", running)
+    await _sync_vllm()
     await _sync_single("nemo", running)
     await _sync_ollama(running)
     if card:
@@ -631,6 +688,8 @@ async def _evict(key: str) -> None:
     if inst.engine == "ollama":
         await _unload_ollama(inst.model)
         STORE.manage(inst.model, False)
+    elif inst.engine == "vllm":
+        await asyncio.to_thread(_stop_vllm_models, {inst.model})
     else:
         await asyncio.to_thread(_stop, inst.engine)
     INSTANCES.pop(key, None)
@@ -716,9 +775,9 @@ def _start_job(job: Job, work: Any) -> dict[str, Any]:
 
 
 def _replacements(engine: Engine, key: str) -> list[str]:
-    """vllm and nemo hold one model: the other one, if any, has to go. Refused if it
-    is pinned, starting or running a job."""
-    if engine not in ("vllm", "nemo"):
+    """nemo holds one model: the other one, if any, has to go. Refused if it is
+    pinned, starting or running a job. vLLM models sit side by side."""
+    if engine != "nemo":
         return []
     others = [i for i in INSTANCES.values() if i.engine == engine and i.key != key]
     for other in others:
@@ -858,30 +917,52 @@ async def _start_ollama(job: Job, inst: Instance) -> str:
     return f"{inst.model} is up at {PUBLIC['ollama']}"
 
 
+def _free_vllm_port() -> int:
+    """Lowest port no running vLLM container holds. A stopped container still on it
+    is removed first (its name is taken by the port)."""
+    rows = _vllm_containers()
+    busy = {int(r["labels"].get("port", -1)) for r in rows if r["running"]}
+    busy |= {i.port for i in INSTANCES.values() if i.engine == "vllm" and i.port}
+    for port in VLLM_PORTS:
+        if port not in busy:
+            _remove_vllm([r["name"] for r in rows if r["name"] == _vllm_name(port)])
+            return port
+    raise RuntimeError(f"all {len(VLLM_PORTS)} vLLM ports ({VLLM_PORTS[0]}-{VLLM_PORTS[-1]}) are in use")
+
+
 def _start_vllm(cfg: dict[str, Any]) -> Any:
     async def start(job: Job, inst: Instance) -> str:
         total = _total() or 1
-        # vLLM refuses to start unless util x card is free; with --kv-cache-memory
-        # that check is all util still does, so ask for exactly the budgeted need.
+        # vLLM refuses to start unless util x card is free now (the card minus what
+        # everything else uses); with --kv-cache-memory that check is all util still
+        # does, so ask for exactly the budgeted need.
         util = min(0.95, math.ceil(inst.vram_mib / total * 1000) / 1000)
-        env = {
-            "VLLM_MODEL": inst.model,
-            "VLLM_MAX_LEN": str(cfg["max_len"]),
-            "VLLM_GPU_UTIL": str(util),
-            "VLLM_KV_BYTES": str(cfg["kv"]),
+        port = await asyncio.to_thread(_free_vllm_port)
+        inst.port = port
+        labels = {
+            "engine": "vllm", "model": inst.model, "port": str(port), "vram_mib": str(inst.vram_mib),
+            "vram_source": inst.vram_source, "record_key": inst.record_key,
         }
-        await asyncio.to_thread(_run, "up", "-d", "--force-recreate", "vllm", env=env)
-        job.detail = "starting (weights, compile, warmup)"
+        args = [
+            "run", "-d", "--no-deps", "--name", _vllm_name(port), "-p", f"127.0.0.1:{port}:8000",
+            *[a for k, v in labels.items() for a in ("--label", f"{LABEL}.{k}={v}")],
+            "vllm",
+            f"--model={inst.model}", f"--max-model-len={cfg['max_len']}",
+            f"--gpu-memory-utilization={util}", f"--kv-cache-memory={cfg['kv']}",
+        ]
+        await asyncio.to_thread(_run, *args)
+        job.detail = f"starting on port {port} (weights, compile, warmup)"
 
         def alive() -> bool:
-            return "vllm" in _running()
+            return any(r["name"] == _vllm_name(port) and r["running"] for r in _vllm_containers())
 
-        if await _wait_http(f"{INTERNAL['vllm']}/v1/models", VLLM_STARTUP_SECS, alive):
-            return f"{inst.model} is up at {PUBLIC['vllm']}"
-        tail = await asyncio.to_thread(_run, "logs", "--no-log-prefix", "--tail", "40", "vllm")
-        with contextlib.suppress(RuntimeError):
-            await asyncio.to_thread(_stop, "vllm")
-        raise RuntimeError(f"vLLM did not become ready. Last log lines:\n{tail}")
+        if await _wait_http(f"{inst.url}/v1/models", VLLM_STARTUP_SECS, alive):
+            return f"{inst.model} is up at {inst.base_url}"
+        tail = subprocess.run(
+            ["docker", "logs", "--tail", "40", _vllm_name(port)], capture_output=True, text=True
+        )
+        await asyncio.to_thread(_remove_vllm, [_vllm_name(port)])
+        raise RuntimeError(f"vLLM did not become ready. Last log lines:\n{(tail.stdout + tail.stderr)[-4000:]}")
 
     return start
 
@@ -986,12 +1067,16 @@ async def _run_whisper(job: Job, client: httpx.AsyncClient, wav: Path, audio_s: 
                        vllm: str, code: str) -> tuple[dict[str, Any], float]:
     """One transcription on vLLM. Returns the reply and the seconds it took."""
     job.detail = "waiting for the vllm engine"
+    inst = INSTANCES.get(vllm)
+    if inst is None or not inst.port:
+        raise RuntimeError(f"{job.model} is no longer up")
+    url = inst.url
     async with _queue(vllm, TRANSCRIBE_CONCURRENCY):
         job.detail = f"transcribing {audio_s / 60:.0f} min of audio"
         started = time.monotonic()
         with wav.open("rb") as f:
             resp = await client.post(
-                f"{INTERNAL['vllm']}/v1/audio/transcriptions",
+                f"{url}/v1/audio/transcriptions",
                 data={"model": job.model, "language": code, "response_format": "verbose_json", "temperature": "0"},
                 files={"file": ("audio.wav", f, "audio/wav")},
             )
@@ -1099,7 +1184,7 @@ async def status() -> dict[str, Any]:
     up = []
     for inst in sorted(INSTANCES.values(), key=lambda i: i.key):
         if inst.engine == "vllm":
-            ready = not inst.starting and await _wait_http(f"{INTERNAL['vllm']}/v1/models", 0.1)
+            ready = not inst.starting and bool(inst.port) and await _wait_http(f"{inst.url}/v1/models", 0.1)
         elif inst.engine == "nemo":
             ready = not inst.starting and await _wait_http(f"{INTERNAL['nemo']}/health", 0.1)
         else:
@@ -1108,7 +1193,7 @@ async def status() -> dict[str, Any]:
             "engine": inst.engine,
             "model": inst.model,
             "models": [inst.model],
-            "base_url": PUBLIC.get(inst.engine),
+            "base_url": inst.base_url,
             "ready": ready,
             "vram_mib": inst.vram_mib,
             "vram_source": inst.vram_source,
@@ -1212,7 +1297,9 @@ async def model_up(
     returns the plan without doing anything. vram_mib (MiB, at most the card) declares
     the need and wins over aias's own measurement, to correct a wrong one. pin=true
     keeps it from being evicted (false unpins).
-    vllm holds one model: asking for another replaces it. max_model_len and
+    Each vllm model gets its own container and port (8000 first, up to 8009; status
+    gives each its base_url); nemo holds one model, so asking for another replaces
+    it. max_model_len and
     gpu_memory_utilization apply to vllm only; left out, they are 8192 and 0.8, or 448
     and 0.4 for a Whisper model. vLLM startup takes 40 s to several minutes; the first
     nemo start builds its image and takes about 5 minutes. Returns a job; when it is
@@ -1284,15 +1371,24 @@ def _cancel(jobs: list[Job]) -> list[asyncio.Task]:
     return tasks
 
 
-def _stop_if_running(engine: Engine, names: set[str]) -> bool:
-    """Stop the vllm or nemo container if it runs one of names. The check and the
-    stop share the compose lock, so an up still finishing in a cancelled job's
+def _stop_vllm_models(names: set[str]) -> list[str]:
+    """Remove every vLLM container (running or not) labelled with one of names.
+    Under the compose lock, so a start still finishing in a cancelled job's
     thread completes first and is then seen."""
+    with _COMPOSE_LOCK:
+        gone = [r for r in _vllm_containers() if r["labels"].get("model") in names]
+        _remove_vllm([r["name"] for r in gone])
+    return sorted({r["labels"]["model"] for r in gone})
+
+
+def _stop_if_running(engine: Engine, names: set[str]) -> bool:
+    """Stop the vllm containers or the nemo container that run one of names."""
+    if engine == "vllm":
+        return bool(_stop_vllm_models(names))
     with _COMPOSE_LOCK:
         if engine not in _running():
             return False
-        running = _vllm_model_from_container() if engine == "vllm" else _nemo_model_from_container()
-        if running not in names:
+        if _nemo_model_from_container() not in names:
             return False
         _stop(engine)
         return True
@@ -1322,6 +1418,7 @@ async def model_down(model: str | None = None) -> dict[str, Any]:
         # No reconcile may read the containers mid-stop and put a model back.
         async with _RECONCILE_LOCK:
             await asyncio.to_thread(_stop, *ENGINES)
+            await asyncio.to_thread(lambda: _remove_vllm([r["name"] for r in _vllm_containers()]))
             for inst in list(INSTANCES.values()):
                 STORE.pin(inst.key, False)
                 if inst.engine == "ollama":
@@ -1433,7 +1530,7 @@ async def transcribe(
     for up in (inst, nemo):
         if up is not None and up.key in EVICTING:
             raise ToolError(f"{up.model} is being stopped to make room for another model")
-    if not await _wait_http(f"{INTERNAL['vllm']}/v1/models", 0.1):
+    if not inst.port or not await _wait_http(f"{inst.url}/v1/models", 0.1):
         raise ToolError(f"{inst.model} is still starting; wait for its model_up job to finish")
     inst.last_used = time.time()
     job = Job("transcribe", "vllm", inst.model, instance=inst.key)
@@ -1459,10 +1556,18 @@ async def job_status(job_id: str, wait_seconds: int = 30) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def logs(engine: Engine, lines: int = 100) -> str:
-    """Recent log lines of an engine, for diagnosing a failed start."""
+async def logs(engine: Engine, lines: int = 100, model: str | None = None) -> str:
+    """Recent log lines of an engine, for diagnosing a failed start. For vllm, model
+    picks which model's container (default: the one on the lowest port)."""
     lines = max(1, min(lines, 1000))
-    return await asyncio.to_thread(_run, "logs", "--no-log-prefix", "--tail", str(lines), engine)
+    if engine != "vllm":
+        return await asyncio.to_thread(_run, "logs", "--no-log-prefix", "--tail", str(lines), engine)
+    rows = sorted(await asyncio.to_thread(_vllm_containers), key=lambda r: int(r["labels"].get("port", 0) or 0))
+    rows = [r for r in rows if model is None or r["labels"].get("model") == model]
+    if not rows:
+        raise ToolError(f"no vLLM container{' for ' + model if model else ''}; status lists what is up")
+    out = subprocess.run(["docker", "logs", "--tail", str(lines), rows[0]["name"]], capture_output=True, text=True)
+    return out.stdout + out.stderr
 
 
 @mcp.custom_route("/health", methods=["GET"])

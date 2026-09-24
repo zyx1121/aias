@@ -82,7 +82,7 @@ Any other MCP client:
 
 ## Sharing the GPU
 
-Several models stay up at once: one Ollama server with any number of models, one vLLM model and one nemo model. aias keeps a ledger of what each holds and admits a new model only when
+Several models stay up at once: one Ollama server with any number of models, up to 10 vLLM models (each in its own container on its own port, 8000 to 8009, lowest free first, so a lone model is still on 8000) and one nemo model. aias keeps a ledger of what each holds and admits a new model only when
 
 - the ledger plus the new need fits the budget: card memory − 1024 MiB for the desktop − 512 MiB margin (8704 MiB on a 10 GB card; `AIAS_DESKTOP_RESERVE_MIB` and `AIAS_SAFETY_MIB` override them), and
 - nvidia-smi shows at least the need + 512 MiB free.
@@ -99,7 +99,7 @@ The ledger decides, not nvidia-smi: under WSL an overcommitted card does not fai
 
 vLLM normally sizes its KV cache from whatever is free on the card, so next to another engine it would take a different amount each time. aias passes `--kv-cache-memory` instead (450 MB for Whisper; for other models the budget left after the weights of the current revision and 1.5 GiB of overhead), so an instance takes what it was budgeted for. If that KV cache cannot hold one `max_model_len` sequence (layers, KV heads and head size from the model's `config.json`), `model_up` refuses and says which `vram_mib` would.
 
-When a model does not fit, `model_up` changes nothing and returns `{refused, fits, need_mib, free_mib, evict}`. `evict` is the fewest models to stop, never pinned ones or ones running a job. Among sets of that size, it compares the most recently used member of each and picks the set where that one was used longest ago (then the next most recent, and so on), so the models used last are the last to go; pass `evict: "auto"` to stop exactly those. The job plans again once it holds the placement lock and stops the whole set or nothing. If even that is not enough, `evict` is empty and the reason says so. vLLM and nemo hold one model each, so asking for a different one replaces it (unless it is pinned or busy).
+When a model does not fit, `model_up` changes nothing and returns `{refused, fits, need_mib, free_mib, evict}`. `evict` is the fewest models to stop, never pinned ones or ones running a job. Among sets of that size, it compares the most recently used member of each and picks the set where that one was used longest ago (then the next most recent, and so on), so the models used last are the last to go; pass `evict: "auto"` to stop exactly those. The job plans again once it holds the placement lock and stops the whole set or nothing. If even that is not enough, `evict` is empty and the reason says so. nemo holds one model, so asking for a different one replaces it (unless it is pinned or busy); vLLM models do not replace each other.
 
 Every 10 s aias compares nvidia-smi with the ledger. If more is in use than the ledger and the desktop reserve explain, `status` shows `pressure: true` and new models are refused until it clears; nothing running is stopped. `over_budget` means clients loaded more into Ollama directly than the budget allows, and `cpu_offload` on an Ollama model means Ollama itself put part of it in system memory.
 
@@ -172,14 +172,14 @@ Setup imports Ubuntu 24.04 as a WSL distro named `aias` under `C:\ProgramData\ai
 |----------|--------|
 | `http://127.0.0.1:11400/mcp` | MCP server |
 | `http://127.0.0.1:11434/v1` | Ollama, OpenAI compatible |
-| `http://127.0.0.1:8000/v1` | vLLM, OpenAI compatible |
+| `http://127.0.0.1:8000/v1` to `:8009/v1` | vLLM, OpenAI compatible, one port per model; `status` gives each model's `base_url` |
 
-nemo has no port of its own: only the MCP server talks to it.
+nemo has no port of its own: only the MCP server talks to it. Each vLLM model runs in its own container made with `docker compose run`, named `aias-vllm-<port>` and labelled `aias.engine=vllm`, `aias.model`, `aias.port` and what the ledger booked for it; `compose stop` does not reach such containers, so aias finds, stops and (after a restart of the MCP server) re-adopts them by these labels.
 
 ## Limitations
 
 - NVIDIA only: vLLM and the container toolkit need CUDA.
-- One vLLM model at a time (plus one nemo model and any number of Ollama models).
+- Up to 10 vLLM models, one nemo model and any number of Ollama models at a time, as far as the budget allows.
 - Models loaded into Ollama by other clients are tracked but not admitted: they can push the ledger past the budget (`over_budget`).
 - `diarize` and `transcribe` take a public URL, not a local file or a LAN address: upload the recording somewhere reachable from the internet first.
 - `transcribe` has no speaker labels; match its segments against a `diarize` RTTM by time.
