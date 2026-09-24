@@ -1,4 +1,4 @@
-"""aias MCP server: pull, start and stop local models on one GPU.
+"""aias MCP server: pull, start and stop local models on one GPU, and diarize audio.
 
 Runs in a container next to the engines and drives them through the Docker
 socket with the same compose file a person would use by hand.
@@ -21,30 +21,37 @@ from typing import Any, Literal
 import httpx
 from huggingface_hub import HfApi, scan_cache_dir, snapshot_download
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-Engine = Literal["ollama", "vllm"]
-ENGINES: tuple[Engine, ...] = ("ollama", "vllm")
+Engine = Literal["ollama", "vllm", "nemo"]
+ENGINES: tuple[Engine, ...] = ("ollama", "vllm", "nemo")
+Mode = Literal["offline", "low", "verylow", "ultralow"]
 
 COMPOSE = ["docker", "compose", "-f", os.environ.get("AIAS_COMPOSE", "/opt/aias/compose.yaml")]
 PORT = 11400
 # Inside the compose network the engines answer on their service names.
-INTERNAL = {"ollama": "http://ollama:11434", "vllm": "http://vllm:8000"}
-# What a client on the Windows host uses.
+INTERNAL = {"ollama": "http://ollama:11434", "vllm": "http://vllm:8000", "nemo": "http://nemo:8100"}
+# What a client on the Windows host uses. nemo has no port; diarize reaches it.
 PUBLIC = {"ollama": "http://127.0.0.1:11434/v1", "vllm": "http://127.0.0.1:8000/v1"}
 OLLAMA_MANIFESTS = Path("/ollama/models/manifests")
 VLLM_STARTUP_SECS = 900
+NEMO_STARTUP_SECS = 600
+NEMO_IMAGE = "aias-nemo:local"
 
 mcp = MCPServer(
     "aias",
     instructions=(
-        "Local model host on one NVIDIA GPU. Two engines: ollama (names like qwen3:8b) "
-        "and vllm (Hugging Face ids like Qwen/Qwen3-0.6B). Only one model is up at a time; "
-        "model_up stops whatever else is running. Pulls and startups are jobs, one at a time: "
-        "poll job_status until it finishes before starting the next. "
-        "Once a model is up, call it through the OpenAI compatible base_url that status returns."
+        "Local model host on one NVIDIA GPU. Three engines: ollama (names like qwen3:8b), "
+        "vllm (Hugging Face ids like Qwen/Qwen3-0.6B) and nemo, speaker diarization "
+        "(nvidia/Nemotron-3-Diarization). Only one model is up at a time; "
+        "model_up stops whatever else is running. Pulls, startups and diarize runs are jobs, "
+        "one at a time: poll job_status until it finishes before starting the next. "
+        "Once an ollama or vllm model is up, call it through the OpenAI compatible base_url "
+        "that status returns. Once nemo is up, call diarize with an audio URL; the finished "
+        "job carries the RTTM and seconds per speaker."
     ),
 )
 
@@ -75,7 +82,7 @@ def _run(*args: str, env: dict[str, str] | None = None, timeout: float = 600) ->
 
 def _running() -> dict[str, dict[str, Any]]:
     """Engine containers that exist, keyed by service, with their state."""
-    out = _run("ps", "--all", "--format", "json", "ollama", "vllm")
+    out = _run("ps", "--all", "--format", "json", *ENGINES)
     rows = []
     for line in out.splitlines():
         line = line.strip()
@@ -97,6 +104,20 @@ def _vllm_model_from_container() -> str | None:
     for arg in json.loads(out.stdout or "[]"):
         if arg.startswith("--model="):
             return arg.split("=", 1)[1]
+    return None
+
+
+def _nemo_model_from_container() -> str | None:
+    out = subprocess.run(
+        ["docker", "inspect", "-f", "{{json .Config.Env}}", "aias-nemo-1"],
+        capture_output=True,
+        text=True,
+    )
+    if out.returncode != 0:
+        return None
+    for var in json.loads(out.stdout or "[]"):
+        if var.startswith("NEMO_MODEL="):
+            return var.split("=", 1)[1]
     return None
 
 
@@ -152,19 +173,20 @@ def _ollama_models() -> list[dict[str, Any]]:
     return sorted(models, key=lambda m: m["model"])
 
 
-def _vllm_models() -> list[dict[str, Any]]:
+def _hf_models() -> list[dict[str, Any]]:
+    """Hugging Face repos in the shared cache. A repo with a .nemo file is for nemo."""
     try:
         cache = scan_cache_dir()
     except Exception:
         return []
-    return sorted(
-        (
-            {"engine": "vllm", "model": repo.repo_id, "size_gb": round(repo.size_on_disk / 1e9, 2)}
-            for repo in cache.repos
-            if repo.repo_type == "model"
-        ),
-        key=lambda m: m["model"],
-    )
+    models = []
+    for repo in cache.repos:
+        if repo.repo_type != "model":
+            continue
+        files = {f.file_name for rev in repo.revisions for f in rev.files}
+        engine = "nemo" if any(name.endswith(".nemo") for name in files) else "vllm"
+        models.append({"engine": engine, "model": repo.repo_id, "size_gb": round(repo.size_on_disk / 1e9, 2)})
+    return sorted(models, key=lambda m: m["model"])
 
 
 # ---------------------------------------------------------------- jobs
@@ -178,13 +200,14 @@ class Job:
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     state: Literal["running", "done", "error"] = "running"
     detail: str = ""
+    result: dict[str, Any] | None = None
     started: float = field(default_factory=time.time)
     finished: float | None = None
     task: asyncio.Task | None = None
 
     def view(self) -> dict[str, Any]:
         end = self.finished or time.time()
-        return {
+        view = {
             "job_id": self.id,
             "kind": self.kind,
             "engine": self.engine,
@@ -193,6 +216,9 @@ class Job:
             "detail": self.detail,
             "elapsed_s": round(end - self.started),
         }
+        if self.result is not None:
+            view["result"] = self.result
+        return view
 
 
 JOBS: dict[str, Job] = {}
@@ -206,7 +232,7 @@ def _refuse_if_busy() -> None:
     # One job at a time: a pull may start the ollama server and an up stops the
     # other engine, so overlapping jobs could leave two engines on one GPU.
     if (job := _busy()) is not None:
-        raise RuntimeError(
+        raise ToolError(
             f"job {job.id} ({job.kind} {job.model}) is still running; "
             "wait for it with job_status, then retry"
         )
@@ -269,19 +295,30 @@ async def _pull_ollama(job: Job) -> str:
     return f"pulled {job.model}"
 
 
-async def _pull_vllm(job: Job) -> str:
+async def _pull_hf(job: Job) -> str:
     files = await asyncio.to_thread(HfApi().list_repo_files, job.model)
-    ignore = ["*.pth", "original/*"]
-    if any(f.endswith(".safetensors") for f in files):
-        ignore.append("*.bin")
-    job.detail = f"downloading {len(files)} files"
-    path = await asyncio.to_thread(snapshot_download, job.model, ignore_patterns=ignore)
+    if job.engine == "nemo":
+        # NeMo loads the single .nemo archive; skip the safetensors, gguf and demo video.
+        patterns: dict[str, Any] = {"allow_patterns": ["*.nemo"]}
+        if not any(f.endswith(".nemo") for f in files):
+            raise RuntimeError(f"{job.model} has no .nemo file, so the nemo engine cannot load it")
+    else:
+        ignore = ["*.pth", "original/*"]
+        if any(f.endswith(".safetensors") for f in files):
+            ignore.append("*.bin")
+        patterns = {"ignore_patterns": ignore}
+    job.detail = f"downloading from {len(files)} files"
+    path = await asyncio.to_thread(snapshot_download, job.model, **patterns)
     size = sum(p.stat().st_size for p in Path(path).rglob("*") if p.is_file())
     return f"pulled {job.model} ({size / 1e9:.2f} GB)"
 
 
+def _others(engine: Engine) -> list[Engine]:
+    return [e for e in ENGINES if e != engine]
+
+
 async def _up_ollama(job: Job) -> str:
-    await asyncio.to_thread(_stop, "vllm")
+    await asyncio.to_thread(_stop, *_others("ollama"))
     await _ensure_ollama_server()
     job.detail = "loading into VRAM"
     async with httpx.AsyncClient(timeout=600) as client:
@@ -294,7 +331,7 @@ async def _up_ollama(job: Job) -> str:
 
 
 async def _up_vllm(job: Job, max_model_len: int, gpu_memory_utilization: float) -> str:
-    await asyncio.to_thread(_stop, "ollama")
+    await asyncio.to_thread(_stop, *_others("vllm"))
     env = {
         "VLLM_MODEL": job.model,
         "VLLM_MAX_LEN": str(max_model_len),
@@ -310,6 +347,42 @@ async def _up_vllm(job: Job, max_model_len: int, gpu_memory_utilization: float) 
         return f"{job.model} is up at {PUBLIC['vllm']}"
     tail = await asyncio.to_thread(_run, "logs", "--no-log-prefix", "--tail", "40", "vllm")
     raise RuntimeError(f"vLLM did not become ready. Last log lines:\n{tail}")
+
+
+def _nemo_image_exists() -> bool:
+    return subprocess.run(["docker", "image", "inspect", NEMO_IMAGE], capture_output=True).returncode == 0
+
+
+async def _up_nemo(job: Job) -> str:
+    await asyncio.to_thread(_stop, *_others("nemo"))
+    if not await asyncio.to_thread(_nemo_image_exists):
+        job.detail = "building the nemo image (first time only, about 5 minutes)"
+        await asyncio.to_thread(_run, "build", "nemo", timeout=3600)
+    await asyncio.to_thread(_run, "up", "-d", "--force-recreate", "nemo", env={"NEMO_MODEL": job.model})
+    job.detail = "loading the model onto the GPU"
+
+    def alive() -> bool:
+        return "nemo" in _running()
+
+    if await _wait_http(f"{INTERNAL['nemo']}/health", NEMO_STARTUP_SECS, alive):
+        return f"{job.model} is up; call diarize"
+    tail = await asyncio.to_thread(_run, "logs", "--no-log-prefix", "--tail", "40", "nemo")
+    raise RuntimeError(f"nemo did not become ready. Last log lines:\n{tail}")
+
+
+async def _diarize(job: Job, audio_url: str, mode: str) -> str:
+    job.detail = f"downloading and diarizing ({mode})"
+    async with httpx.AsyncClient(timeout=httpx.Timeout(3600, connect=10)) as client:
+        resp = await client.post(f"{INTERNAL['nemo']}/diarize", json={"audio_url": audio_url, "mode": mode})
+    try:
+        body = resp.json()
+    except ValueError:
+        body = {"error": resp.text[-1000:]}
+    if resp.status_code != 200:
+        raise RuntimeError(body.get("error") or f"nemo answered HTTP {resp.status_code}")
+    job.result = body
+    speakers = ", ".join(f"{s['speaker']} {s['seconds']:.0f} s" for s in body["speakers"]) or "no speech"
+    return f"{len(body['speakers'])} speakers in {body['audio_s']:.0f} s of audio: {speakers}"
 
 
 # ---------------------------------------------------------------- tools
@@ -340,6 +413,15 @@ async def status() -> dict[str, Any]:
                 "base_url": PUBLIC["vllm"],
             }
         )
+    if "nemo" in running:
+        up.append(
+            {
+                "engine": "nemo",
+                "models": [await asyncio.to_thread(_nemo_model_from_container)],
+                "ready": await _wait_http(f"{INTERNAL['nemo']}/health", 0.1),
+                "base_url": None,
+            }
+        )
     return {
         "up": up,
         "gpu": await asyncio.to_thread(_gpu),
@@ -353,16 +435,17 @@ async def model_list(engine: Engine | None = None) -> list[dict[str, Any]]:
     models: list[dict[str, Any]] = []
     if engine in (None, "ollama"):
         models += await asyncio.to_thread(_ollama_models)
-    if engine in (None, "vllm"):
-        models += await asyncio.to_thread(_vllm_models)
+    if engine != "ollama":
+        models += [m for m in await asyncio.to_thread(_hf_models) if engine in (None, m["engine"])]
     return models
 
 
 @mcp.tool()
 async def model_pull(engine: Engine, model: str) -> dict[str, Any]:
-    """Download a model. ollama takes library names like qwen3:8b; vllm takes Hugging
-    Face repo ids like Qwen/Qwen3-0.6B. Returns a job; poll job_status."""
-    work = _pull_ollama if engine == "ollama" else _pull_vllm
+    """Download a model. ollama takes library names like qwen3:8b; vllm and nemo take Hugging
+    Face repo ids like Qwen/Qwen3-0.6B or nvidia/Nemotron-3-Diarization. Returns a job;
+    poll job_status."""
+    work = _pull_ollama if engine == "ollama" else _pull_hf
     return _start_job(Job("pull", engine, model), work)
 
 
@@ -374,17 +457,20 @@ async def model_up(
     gpu_memory_utilization: float = 0.8,
 ) -> dict[str, Any]:
     """Load a model so it serves requests, stopping any other engine first. The two
-    tuning arguments apply to vllm only. vLLM startup takes 40 s to several minutes.
-    Returns a job; when it is done, status shows the base_url."""
+    tuning arguments apply to vllm only. vLLM startup takes 40 s to several minutes; the
+    first nemo start builds its image and takes about 5 minutes.
+    Returns a job; when it is done, status shows the base_url (nemo has none: use diarize)."""
     job = Job("up", engine, model)
     if engine == "ollama":
         return _start_job(job, _up_ollama)
+    if engine == "nemo":
+        return _start_job(job, _up_nemo)
     return _start_job(job, lambda j: _up_vllm(j, max_model_len, gpu_memory_utilization))
 
 
 @mcp.tool()
 async def model_down() -> dict[str, Any]:
-    """Stop every engine and free the GPU. Cancels a pull or up job that is still running."""
+    """Stop every engine and free the GPU. Cancels a pull, up or diarize job that is still running."""
     if (job := _busy()) is not None and job.task is not None:
         job.task.cancel()
         await asyncio.wait({job.task}, timeout=30)
@@ -393,11 +479,27 @@ async def model_down() -> dict[str, Any]:
 
 
 @mcp.tool()
+async def diarize(audio_url: str, mode: Mode = "offline") -> dict[str, Any]:
+    """Label who spoke when in an audio file, up to 8 speakers, with the nemo engine
+    (model_up engine=nemo first). audio_url is an http(s) link the server downloads; any
+    format ffmpeg reads, up to 2 GB. mode trades accuracy for latency: offline (best),
+    low (1.04 s), verylow (0.64 s), ultralow (0.32 s); the streaming modes are slower on
+    a whole file. Returns a job; when it is done, job_status carries result with the
+    RTTM text and the seconds each speaker talked."""
+    running = await asyncio.to_thread(_running)
+    if "nemo" not in running:
+        raise ToolError("nemo is not up: run model_up engine=nemo model=nvidia/Nemotron-3-Diarization first")
+    model = await asyncio.to_thread(_nemo_model_from_container) or "nemo"
+    return _start_job(Job("diarize", "nemo", model), lambda j: _diarize(j, audio_url, mode))
+
+
+@mcp.tool()
 async def job_status(job_id: str, wait_seconds: int = 30) -> dict[str, Any]:
-    """Progress of a pull or up job. Blocks up to wait_seconds (max 120) for it to finish."""
+    """Progress of a pull, up or diarize job. Blocks up to wait_seconds (max 120) for it to
+    finish. A finished diarize job carries its output in result."""
     job = JOBS.get(job_id)
     if job is None:
-        raise ValueError(f"no job {job_id}; jobs do not survive a server restart")
+        raise ToolError(f"no job {job_id}; jobs do not survive a server restart")
     if job.task is not None and job.state == "running":
         await asyncio.wait({job.task}, timeout=max(0, min(wait_seconds, 120)))
     return job.view()
