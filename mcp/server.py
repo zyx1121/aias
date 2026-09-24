@@ -481,8 +481,14 @@ async def _diarize(job: Job, audio_url: str, mode: str) -> str:
     return f"{len(body['speakers'])} speakers in {body['audio_s']:.0f} s of audio: {speakers}"
 
 
+def _whisper_language(language: str) -> str:
+    """zh-TW, zh-Hant, zh_CN and the like to the bare ISO 639-1 code Whisper takes."""
+    return language.replace("_", "-").split("-")[0].strip().lower()
+
+
 async def _transcribe(job: Job, audio_url: str, language: str, traditional: bool) -> str:
     timing: dict[str, float] = {}
+    code = _whisper_language(language)
 
     async def send(client: httpx.AsyncClient, wav: Path, audio_s: float) -> httpx.Response:
         timing["audio_s"] = audio_s
@@ -492,7 +498,7 @@ async def _transcribe(job: Job, audio_url: str, language: str, traditional: bool
                 f"{INTERNAL['vllm']}/v1/audio/transcriptions",
                 data={
                     "model": job.model,
-                    "language": language,
+                    "language": code,
                     "response_format": "verbose_json",
                     "temperature": "0",
                 },
@@ -503,7 +509,7 @@ async def _transcribe(job: Job, audio_url: str, language: str, traditional: bool
 
     body = await _audio_job(job, audio_url, "vllm", send)
     # OpenCC only makes sense for Chinese; it would leave other text alone, but skip it.
-    traditional = traditional and language.lower().startswith("zh")
+    traditional = traditional and code == "zh"
     convert = _S2TW.convert if traditional else (lambda text: text)
     segments = [
         {"start": round(seg["start"], 2), "end": round(seg["end"], 2), "text": convert(seg["text"].strip())}
@@ -511,7 +517,7 @@ async def _transcribe(job: Job, audio_url: str, language: str, traditional: bool
     ]
     job.result = {
         "model": job.model,
-        "language": language,
+        "language": code,
         "traditional": traditional,
         "audio_s": round(timing["audio_s"], 1),
         "elapsed_s": round(timing["elapsed_s"], 2),
@@ -644,9 +650,10 @@ async def transcribe(audio_url: str, language: str = "zh", traditional: bool = T
     """Speech to text with timestamps, with a Whisper model on vllm (model_up engine=vllm
     model=openai/whisper-large-v3 first). audio_url is an http(s) link the server
     downloads; any format ffmpeg reads, up to 2 GB and 2 hours. language is an ISO 639-1
-    code. traditional converts simplified Chinese characters to traditional (Taiwan),
-    because Whisper drifts to simplified; it applies only when language starts with zh. Returns a job; when it is done, job_status
-    carries result with the full text and segments (start, end, text) in seconds."""
+    code; a tag like zh-TW or zh_CN is cut to zh. traditional converts simplified Chinese
+    characters to traditional (Taiwan), because Whisper drifts to simplified; it applies
+    only to zh. Returns a job; when it is done, job_status carries result with the full
+    text and segments (start, end, text) in seconds."""
     running = await asyncio.to_thread(_running)
     model = await asyncio.to_thread(_vllm_model_from_container) if "vllm" in running else None
     if not _is_whisper(model):

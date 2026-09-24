@@ -10,9 +10,9 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import os
-import resource
 import signal
 import socket
+import stat
 import wave
 from pathlib import Path
 
@@ -33,10 +33,17 @@ DECODE_SECS = 600
 PROBE_SECS = 60
 MAX_REDIRECTS = 5
 # ffmpeg and ffprobe parse untrusted files in a container that holds the Docker
-# socket, so they run as nobody, which cannot open the socket, with limits on
-# what they can write and map. 2 GiB of address space decodes 2 hours of FLAC.
+# socket, so they run as nobody, which cannot open the socket, with no way to
+# regain privileges and limits on what they can write and map. 2 GiB of
+# address space decodes 2 hours of FLAC.
 NOBODY = 65534
 DECODER_MAX_AS = 2 * 1024**3
+# util-linux tools, applied by exec in turn (no Python runs after fork):
+# prlimit sets the limits, setpriv drops to nobody and sets no_new_privs.
+SANDBOX = [
+    "prlimit", f"--fsize={MAX_WAV_BYTES}", f"--as={DECODER_MAX_AS}", "--",
+    "setpriv", "--no-new-privs", f"--reuid={NOBODY}", f"--regid={NOBODY}", "--clear-groups", "--",
+]
 
 
 class AudioError(Exception):
@@ -114,24 +121,16 @@ async def _download(url: str, dest: Path) -> None:
         raise AudioError(f"could not download audio_url: {type(exc).__name__} {exc}".rstrip()) from exc
 
 
-def _limit_decoder() -> None:
-    # Runs in the child between fork and exec.
-    resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_WAV_BYTES, MAX_WAV_BYTES))
-    resource.setrlimit(resource.RLIMIT_AS, (DECODER_MAX_AS, DECODER_MAX_AS))
-
-
 async def _run_decoder(args: list[str], timeout: float) -> tuple[int, str, str]:
-    """Run ffmpeg or ffprobe as nobody under _limit_decoder. The process is killed
-    when the job is cancelled or the timeout passes, so none is left behind."""
+    """Run ffmpeg or ffprobe inside SANDBOX. prlimit and setpriv exec rather than
+    fork, so the process is the decoder itself; it is killed when the job is
+    cancelled or the timeout passes, so none is left behind."""
     proc = await asyncio.create_subprocess_exec(
+        *SANDBOX,
         *args,
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        user=NOBODY,
-        group=NOBODY,
-        extra_groups=[],
-        preexec_fn=_limit_decoder,
     )
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout)
@@ -143,8 +142,23 @@ async def _run_decoder(args: list[str], timeout: float) -> tuple[int, str, str]:
     return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
 
 
-def _minutes(seconds: float) -> str:
-    return f"{seconds / 60:.1f} minutes"
+def _seconds(seconds: float) -> str:
+    return f"{seconds:.1f} seconds"
+
+
+def _wav_seconds(wav: Path) -> float:
+    """Length of the decoder's WAV. It was written by nobody, so open it without
+    following a symlink and check it is a plain file that nobody owns."""
+    try:
+        fd = os.open(wav, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise AudioError(f"the decoder left no readable WAV: {exc.strerror}") from None
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != NOBODY:
+        os.close(fd)
+        raise AudioError("the decoder's output is not a plain file it owns")
+    with os.fdopen(fd, "rb") as f, wave.open(f) as w:
+        return w.getnframes() / w.getframerate()
 
 
 async def _probe_seconds(src: Path) -> float | None:
@@ -163,10 +177,10 @@ async def _probe_seconds(src: Path) -> float | None:
 
 async def _decode(src: Path, wav: Path) -> float:
     """Decode src to 16 kHz mono s16 WAV at wav and return its length in seconds."""
-    limit = f"the limit is {MAX_AUDIO_SECS // 60} minutes"
+    limit = f"the limit is {MAX_AUDIO_SECS} seconds"
     probed = await _probe_seconds(src)
     if probed is not None and probed > MAX_AUDIO_SECS:
-        raise AudioError(f"audio is {_minutes(probed)}; {limit}")
+        raise AudioError(f"audio is {_seconds(probed)}; {limit}")
     # -t and -fs bound the decoded size even when the container's duration is
     # missing or wrong; RLIMIT_FSIZE backs up -fs.
     try:
@@ -179,14 +193,13 @@ async def _decode(src: Path, wav: Path) -> float:
     except TimeoutError:
         raise AudioError(f"decoding the audio took longer than {DECODE_SECS} s") from None
     if code == -signal.SIGXFSZ:
-        raise AudioError(f"audio is longer than the {MAX_AUDIO_SECS // 60} minute limit")
+        raise AudioError(f"audio is longer than the {MAX_AUDIO_SECS} second limit")
     if code != 0:
         raise AudioError(f"ffmpeg could not decode the audio: {err.strip()[-500:]}")
-    with wave.open(str(wav)) as w:
-        duration = w.getnframes() / w.getframerate()
+    duration = _wav_seconds(wav)
     if duration > MAX_AUDIO_SECS:
         # Decoding stopped at the cap, so the real length is unknown.
-        raise AudioError(f"audio is longer than the {MAX_AUDIO_SECS // 60} minute limit")
+        raise AudioError(f"audio is longer than the {MAX_AUDIO_SECS} second limit")
     if duration == 0:
         raise AudioError("audio has no samples")
     return duration
@@ -199,5 +212,9 @@ async def fetch_wav(url: str, workdir: Path) -> tuple[Path, float]:
     src, wav = workdir / "input", workdir / "audio.wav"
     await _download(url, src)
     duration = await _decode(src, wav)
+    # Take the directory back so nothing running as nobody can swap the WAV
+    # between this check and the engine reading it.
+    os.chown(workdir, 0, 0)
+    os.chmod(workdir, 0o700)
     src.unlink(missing_ok=True)
     return wav, duration
