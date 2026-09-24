@@ -2,7 +2,9 @@
 transcribe audio.
 
 Runs in a container next to the engines and drives them through the Docker
-socket with the same compose file a person would use by hand.
+socket with the same compose file a person would use by hand. Several models
+share the card: one Ollama server (any number of models), one vLLM model and
+one nemo model, admitted against a VRAM budget (vram.py).
 """
 
 from __future__ import annotations
@@ -10,6 +12,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
+import math
 import os
 import re
 import subprocess
@@ -30,11 +34,13 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+import vram
 from audio import AudioError, fetch_wav
 
 Engine = Literal["ollama", "vllm", "nemo"]
 ENGINES: tuple[Engine, ...] = ("ollama", "vllm", "nemo")
 Mode = Literal["offline", "low", "verylow", "ultralow"]
+Evict = Literal["never", "auto"]
 
 COMPOSE = ["docker", "compose", "-f", os.environ.get("AIAS_COMPOSE", "/opt/aias/compose.yaml")]
 PORT = 11400
@@ -53,27 +59,46 @@ NEMO_REPO = re.compile(r"nvidia/(?!\.+$)[A-Za-z0-9_.-]+")
 # 10 minutes and the audio at 2 hours, which ultralow diarization needs about
 # 25 minutes for.
 AUDIO_JOB_SECS = 3600
-# model_up defaults for vllm. Whisper's decoder takes 448 tokens and the model
-# needs about 4.2 GB, so it gets its own budget; 0.37 of 10 GB fails to start.
+# model_up defaults for vllm. Whisper's decoder takes 448 tokens; the others
+# get 80 % of the card, as vLLM's own default would.
 VLLM_DEFAULTS = {"max_model_len": 8192, "gpu_memory_utilization": 0.8}
 WHISPER_DEFAULTS = {"max_model_len": 448, "gpu_memory_utilization": 0.4}
+# vLLM sizes its KV cache from "whole card minus what is in use", which next to
+# another engine is not this instance's share. aias always passes
+# --kv-cache-memory instead, so an instance takes a fixed amount whatever else
+# is on the card. Whisper needs at least 0.38 GiB; other models get what their
+# budget leaves after the weights and about 1.5 GiB of context and activations.
+WHISPER_KV_BYTES = 450_000_000
+VLLM_OVERHEAD_MIB = 1536
+MIN_KV_MIB = 512
+# Transcriptions a vLLM Whisper instance runs at once; nemo runs one diarize.
+TRANSCRIBE_CONCURRENCY = int(os.environ.get("AIAS_TRANSCRIBE_CONCURRENCY", "4"))
+RECONCILE_SECS = 10
+# A container list taken just before a model finished starting must not drop it.
+SETTLE_SECS = 2 * RECONCILE_SECS
 # Whisper drifts from traditional to simplified Chinese after about 30 s.
 # s2tw converts characters only; s2twp would also swap mainland vocabulary for
 # Taiwanese words, which rewrites what the speaker said.
 _S2TW = opencc.OpenCC("s2tw")
+
+log = logging.getLogger("aias")
 
 mcp = MCPServer(
     "aias",
     instructions=(
         "Local model host on one NVIDIA GPU. Three engines: ollama (names like qwen3:8b), "
         "vllm (Hugging Face ids like Qwen/Qwen3-0.6B, or openai/whisper-large-v3 for speech "
-        "to text) and nemo, speaker diarization (nvidia/Nemotron-3-Diarization). Only one "
-        "model is up at a time; model_up stops whatever else is running. Pulls, startups, "
-        "diarize and transcribe runs are jobs, one at a time: poll job_status until it "
-        "finishes before starting the next. Once an ollama or vllm model is up, call it "
-        "through the OpenAI compatible base_url that status returns. Once nemo is up, call "
-        "diarize with an audio URL; once a whisper model is up on vllm, call transcribe. "
-        "The finished job carries the output in result."
+        "to text) and nemo, speaker diarization (nvidia/Nemotron-3-Diarization). Models "
+        "share the card within a VRAM budget: any number of ollama models, one vllm model "
+        "and one nemo model at a time. model_up refuses a model that does not fit and "
+        "returns a plan (fits, need_mib, free_mib, evict); pass evict=\"auto\" to stop the "
+        "least recently used models in that plan, dry_run=true to only see it, and "
+        "pin=true to keep a model from being evicted. Pulls, startups, diarize and "
+        "transcribe runs are jobs: poll job_status until each finishes. Once an ollama or "
+        "vllm model is up, call it through the OpenAI compatible base_url that status "
+        "returns. Once nemo is up, call diarize with an audio URL; once a whisper model is "
+        "up on vllm, call transcribe. The finished job carries the output in result. "
+        "model_down with a model stops only that one; without one it stops everything."
     ),
 )
 
@@ -120,44 +145,32 @@ def _running() -> dict[str, dict[str, Any]]:
     return {r["Service"]: r for r in rows if r.get("State") == "running"}
 
 
-def _vllm_model_from_container() -> str | None:
-    out = subprocess.run(
-        ["docker", "inspect", "-f", "{{json .Args}}", "aias-vllm-1"],
-        capture_output=True,
-        text=True,
-    )
+def _inspect(container: str, fmt: str) -> list[str]:
+    out = subprocess.run(["docker", "inspect", "-f", fmt, container], capture_output=True, text=True)
     if out.returncode != 0:
-        return None
-    for arg in json.loads(out.stdout or "[]"):
-        if arg.startswith("--model="):
-            return arg.split("=", 1)[1]
-    return None
+        return []
+    return json.loads(out.stdout or "[]") or []
+
+
+def _vllm_args_from_container() -> dict[str, str]:
+    """--model, --max-model-len and --kv-cache-memory of the running vLLM."""
+    args = {}
+    for arg in _inspect("aias-vllm-1", "{{json .Args}}"):
+        if arg.startswith("--") and "=" in arg:
+            key, value = arg[2:].split("=", 1)
+            args[key] = value
+    return args
+
+
+def _vllm_model_from_container() -> str | None:
+    return _vllm_args_from_container().get("model")
 
 
 def _nemo_model_from_container() -> str | None:
-    out = subprocess.run(
-        ["docker", "inspect", "-f", "{{json .Config.Env}}", "aias-nemo-1"],
-        capture_output=True,
-        text=True,
-    )
-    if out.returncode != 0:
-        return None
-    for var in json.loads(out.stdout or "[]"):
+    for var in _inspect("aias-nemo-1", "{{json .Config.Env}}"):
         if var.startswith("NEMO_MODEL="):
             return var.split("=", 1)[1]
     return None
-
-
-def _gpu() -> dict[str, Any] | None:
-    out = subprocess.run(
-        ["nvidia-smi", "--query-gpu=name,memory.used,memory.total", "--format=csv,noheader,nounits"],
-        capture_output=True,
-        text=True,
-    )
-    if out.returncode != 0:
-        return None
-    name, used, total = (x.strip() for x in out.stdout.splitlines()[0].split(","))
-    return {"name": name, "memory_used_mib": int(used), "memory_total_mib": int(total)}
 
 
 def _build_nemo() -> None:
@@ -244,6 +257,280 @@ def _hf_models() -> list[dict[str, Any]]:
     return sorted(models, key=lambda m: m["model"])
 
 
+def _disk_mib(engine: str, model: str) -> int | None:
+    listing = _ollama_models() if engine == "ollama" else _hf_models()
+    size = next((m["size_gb"] for m in listing if m["model"] == model), None)
+    return None if size is None else round(size * 1e9 / 2**20)
+
+
+def _ollama_name(model: str) -> str:
+    """Ollama reports qwen3 as qwen3:latest; key both the same way."""
+    return model if ":" in model.rsplit("/", 1)[-1] else f"{model}:latest"
+
+
+def _is_whisper(model: str | None) -> bool:
+    return model is not None and "whisper" in model.lower()
+
+
+def _check_nemo_repo(model: str) -> None:
+    if not NEMO_REPO.fullmatch(model):
+        raise ToolError(f"nemo only loads Hugging Face repos named nvidia/<name>, not {model}")
+
+
+# ---------------------------------------------------------------- ledger
+
+
+@dataclass
+class Instance:
+    """A model that holds (or is about to hold) GPU memory."""
+
+    engine: Engine
+    model: str
+    vram_mib: int
+    vram_source: str  # measured | declared | estimate | ollama_ps
+    record_key: str  # where its measured footprint is stored
+    last_used: float = field(default_factory=time.time)
+    starting: bool = False
+    managed: bool = True  # False: an Ollama model a client loaded, not aias
+    cpu_offload: bool = False  # Ollama put part of it in system memory
+    since: float = field(default_factory=time.time)  # created or last started
+
+    def settled(self) -> bool:
+        return not self.starting and time.time() - self.since > SETTLE_SECS
+
+    @property
+    def key(self) -> str:
+        return f"{self.engine}:{self.model}"
+
+
+INSTANCES: dict[str, Instance] = {}
+# Extra memory a running job holds on top of its instance (nemo's per-file peak).
+BURSTS: dict[str, int] = {}
+STORE = vram.Store()
+# Held while models start, get evicted or bursts get reserved, so two
+# admissions never plan against the same free memory.
+PLACEMENT = asyncio.Lock()
+QUEUES: dict[str, asyncio.Semaphore] = {}
+CARD: dict[str, Any] = {"smi": None, "pressure": False, "unaccounted_mib": 0}
+
+
+def _reserved() -> int:
+    return sum(i.vram_mib for i in INSTANCES.values()) + sum(BURSTS.values())
+
+
+def _total() -> int:
+    return (CARD["smi"] or {}).get("total", 0)
+
+
+def _vllm_config(
+    model: str, max_model_len: int | None, util: float | None, vram_mib: int | None
+) -> dict[str, Any]:
+    """Launch settings and the memory need of a vLLM model. The need comes from a
+    measurement of these exact settings, else the caller's declaration, else
+    util x card."""
+    total = _total()
+    defaults = WHISPER_DEFAULTS if _is_whisper(model) else VLLM_DEFAULTS
+    max_len = max_model_len or defaults["max_model_len"]
+    declared = vram_mib or (round(util * total) if util else None)
+    target = declared or round(defaults["gpu_memory_utilization"] * total)
+    if _is_whisper(model):
+        kv = WHISPER_KV_BYTES
+    else:
+        weights = _disk_mib("vllm", model) or 0
+        kv = max(MIN_KV_MIB, target - weights - VLLM_OVERHEAD_MIB) * 2**20
+    key = f"vllm:{model}:{max_len}:{kv}"
+    measured = STORE.measured(key)
+    if measured:
+        need, source = measured, "measured"
+    elif declared:
+        need, source = declared, "declared"
+    else:
+        need, source = target, "estimate"
+    return {"max_len": max_len, "kv": kv, "record_key": key, "need": need, "source": source}
+
+
+def _simple_need(engine: str, model: str, vram_mib: int | None) -> tuple[int, str, str]:
+    """(need, source, record key) for ollama and nemo."""
+    key = f"{engine}:{model}"
+    if measured := STORE.measured(key):
+        return measured, "measured", key
+    if vram_mib:
+        return vram_mib, "declared", key
+    if engine == "nemo":
+        return vram.NEMO_BASE_MIB, "estimate", key
+    disk = _disk_mib("ollama", model)
+    return (disk or 1024) + vram.OLLAMA_OVERHEAD_MIB, "estimate", key
+
+
+async def _ollama_ps() -> list[dict[str, Any]]:
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            return (await client.get(f"{INTERNAL['ollama']}/api/ps")).json().get("models", [])
+    except (httpx.HTTPError, ValueError):
+        return []
+
+
+async def _sync_single(engine: Engine, running: dict[str, Any]) -> None:
+    """Match the ledger to the vllm or nemo container, which may have been started,
+    stopped or have crashed without aias (or before an MCP restart)."""
+    inst = next((i for i in INSTANCES.values() if i.engine == engine), None)
+    if engine not in running:
+        if inst is not None and inst.settled():
+            del INSTANCES[inst.key]
+        return
+    if inst is not None:
+        return
+    if engine == "vllm":
+        args = await asyncio.to_thread(_vllm_args_from_container)
+        if not (model := args.get("model")):
+            return
+        key = f"vllm:{model}:{args.get('max-model-len')}:{args.get('kv-cache-memory')}"
+        util = float(args.get("gpu-memory-utilization", 0) or 0)
+        need, source = STORE.measured(key), "measured"
+        if not need:
+            need, source = round(util * _total()), "estimate"
+    else:
+        if not (model := await asyncio.to_thread(_nemo_model_from_container)):
+            return
+        need, source, key = _simple_need("nemo", model, None)
+    INSTANCES[f"{engine}:{model}"] = Instance(engine, model, need, source, key)
+
+
+async def _sync_ollama(running: dict[str, Any]) -> None:
+    """Every loaded Ollama model is an instance, whoever loaded it; /api/ps is the
+    truth for its size."""
+    loaded = await _ollama_ps() if "ollama" in running else []
+    seen = set()
+    for m in loaded:
+        name = m.get("name") or m.get("model")
+        key = f"ollama:{name}"
+        seen.add(key)
+        mib = round(m.get("size_vram", 0) / 2**20) + vram.OLLAMA_OVERHEAD_MIB
+        inst = INSTANCES.get(key)
+        if inst is None:
+            inst = INSTANCES[key] = Instance("ollama", name, mib, "ollama_ps", key)
+        elif not inst.starting:
+            inst.vram_mib, inst.vram_source = mib, "ollama_ps"
+        inst.managed = STORE.managed(name)
+        inst.cpu_offload = m.get("size_vram", 0) < m.get("size", 0)
+    for key, inst in list(INSTANCES.items()):
+        if inst.engine == "ollama" and key not in seen and inst.settled():
+            # Unloaded behind aias's back (a client, or Ollama making room itself).
+            STORE.manage(inst.model, False)
+            del INSTANCES[key]
+
+
+_RECONCILE_LOCK = asyncio.Lock()
+
+
+async def _reconcile() -> None:
+    async with _RECONCILE_LOCK:
+        await _reconcile_once()
+
+
+async def _reconcile_once() -> None:
+    running = await asyncio.to_thread(_running)
+    await _sync_single("vllm", running)
+    await _sync_single("nemo", running)
+    await _sync_ollama(running)
+    card = await asyncio.to_thread(vram.smi)
+    CARD["smi"] = card
+    if card:
+        # What nvidia-smi shows beyond the ledger is the desktop and anything
+        # aias does not know about. Past the desktop reserve, stop admitting.
+        CARD["unaccounted_mib"] = card["used"] - _reserved()
+        CARD["pressure"] = CARD["unaccounted_mib"] > vram.DESKTOP_RESERVE_MIB
+
+
+async def _reconcile_forever() -> None:
+    while True:
+        try:
+            await _reconcile()
+        except Exception:  # docker or nvidia-smi briefly unavailable
+            log.exception("reconcile failed")
+        await asyncio.sleep(RECONCILE_SECS)
+
+
+_RECONCILER: asyncio.Task | None = None
+
+
+def _ensure_reconciler() -> None:
+    global _RECONCILER
+    if _RECONCILER is None or _RECONCILER.done():
+        _RECONCILER = asyncio.get_running_loop().create_task(_reconcile_forever())
+
+
+def _jobs_of(key: str, exclude: Job | None = None) -> list[Job]:
+    return [j for j in JOBS.values() if j.state == "running" and j.instance == key and j is not exclude]
+
+
+def _evictable(key: str) -> bool:
+    inst = INSTANCES.get(key)
+    return (
+        inst is not None
+        and not inst.starting
+        and not STORE.pinned(key)
+        and not _jobs_of(key)
+    )
+
+
+def _plan(need: int, protect: set[str], replace: list[str]) -> vram.Plan:
+    card = CARD["smi"] or {}
+    candidates = [
+        vram.Candidate(k, i.vram_mib, i.last_used)
+        for k, i in INSTANCES.items()
+        if k not in protect and k not in replace and _evictable(k)
+    ]
+    return vram.make_plan(
+        need,
+        vram.budget(card.get("total", 0)),
+        _reserved(),
+        card.get("free"),
+        CARD["pressure"],
+        candidates,
+        [vram.Candidate(k, INSTANCES[k].vram_mib, INSTANCES[k].last_used) for k in replace if k in INSTANCES],
+    )
+
+
+def _refusal(plan: vram.Plan) -> dict[str, Any]:
+    return {"refused": True, **plan.view()}
+
+
+async def _evict(key: str) -> None:
+    inst = INSTANCES.get(key)
+    if inst is None:
+        return
+    if inst.engine == "ollama":
+        async with httpx.AsyncClient(timeout=60) as client:
+            with contextlib.suppress(httpx.HTTPError):
+                await client.post(f"{INTERNAL['ollama']}/api/generate", json={"model": inst.model, "keep_alive": 0})
+        for _ in range(30):
+            if not any((m.get("name") or m.get("model")) == inst.model for m in await _ollama_ps()):
+                break
+            await asyncio.sleep(0.5)
+        STORE.manage(inst.model, False)
+    else:
+        await asyncio.to_thread(_stop, inst.engine)
+    INSTANCES.pop(key, None)
+    STORE.pin(key, False)
+
+
+async def _wait_card_free(mib: int, secs: float = 30) -> None:
+    """Freed memory shows on nvidia-smi a moment after a process exits."""
+    deadline = time.monotonic() + secs
+    while time.monotonic() < deadline:
+        card = await asyncio.to_thread(vram.smi)
+        if card is None or card["free"] >= mib:
+            return
+        await asyncio.sleep(1)
+
+
+def _queue(key: str, size: int) -> asyncio.Semaphore:
+    if key not in QUEUES:
+        QUEUES[key] = asyncio.Semaphore(size)
+    return QUEUES[key]
+
+
 # ---------------------------------------------------------------- jobs
 
 
@@ -252,6 +539,7 @@ class Job:
     kind: str
     engine: Engine
     model: str
+    instance: str | None = None  # the Instance key the job runs on or starts
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     state: Literal["running", "done", "error"] = "running"
     detail: str = ""
@@ -279,23 +567,7 @@ class Job:
 JOBS: dict[str, Job] = {}
 
 
-def _busy() -> Job | None:
-    return next((j for j in JOBS.values() if j.state == "running"), None)
-
-
-def _refuse_if_busy() -> None:
-    # One job at a time: a pull may start the ollama server and an up stops the
-    # other engine, so overlapping jobs could leave two engines on one GPU.
-    if (job := _busy()) is not None:
-        raise ToolError(
-            f"job {job.id} ({job.kind} {job.model}) is still running; "
-            "wait for it with job_status, then retry"
-        )
-
-
 def _start_job(job: Job, work: Any) -> dict[str, Any]:
-    _refuse_if_busy()
-
     async def runner() -> None:
         try:
             job.detail = await work(job) or "done"
@@ -309,10 +581,53 @@ def _start_job(job: Job, work: Any) -> dict[str, Any]:
             job.detail = (str(exc) or type(exc).__name__)[-3000:]
         finally:
             job.finished = time.time()
+            BURSTS.pop(job.id, None)
+            if job.instance in INSTANCES and job.kind != "up":
+                INSTANCES[job.instance].last_used = time.time()
 
     JOBS[job.id] = job
     job.task = asyncio.create_task(runner())
     return job.view()
+
+
+async def _place(job: Job, inst: Instance, evict: str, replace: list[str], start: Any) -> str:
+    """Admit inst against the budget, evicting as the plan says if allowed, then
+    start it. Holds PLACEMENT throughout, so the footprint measured around the
+    start is this model's alone when no other job is running."""
+    async with PLACEMENT:
+        job.detail = "waiting for room on the GPU"
+        await _reconcile()
+        plan = _plan(inst.vram_mib, {inst.key}, replace)
+        if not plan.can_fit or (not plan.fits and evict != "auto"):
+            job.result = _refusal(plan)
+            raise RuntimeError(plan.reason or f"{inst.model} does not fit")
+        evicted = []
+        for key in plan.replace + plan.evict:
+            job.detail = f"stopping {key} to make room"
+            await _evict(key)
+            evicted.append(key)
+        if evicted:
+            await _wait_card_free(inst.vram_mib + vram.SAFETY_MIB)
+        quiet = not any(j.state == "running" and j is not job and j.kind != "pull" for j in JOBS.values())
+        before = await asyncio.to_thread(vram.smi)
+        inst.starting = True
+        INSTANCES[inst.key] = inst
+        try:
+            detail = await start(job, inst)
+        except BaseException:
+            if INSTANCES.get(inst.key) is inst:
+                del INSTANCES[inst.key]
+            raise
+        inst.starting = False
+        inst.last_used = inst.since = time.time()
+        if quiet and inst.engine != "ollama" and before:
+            await asyncio.sleep(3)
+            after = await asyncio.to_thread(vram.smi)
+            if after and after["used"] > before["used"]:
+                inst.vram_mib, inst.vram_source = after["used"] - before["used"], "measured"
+                STORE.record(inst.record_key, inst.vram_mib)
+        job.result = {"evicted": evicted, "vram_mib": inst.vram_mib, "vram_source": inst.vram_source}
+        return detail
 
 
 async def _ensure_ollama_server() -> bool:
@@ -345,8 +660,11 @@ async def _pull_ollama(job: Job) -> str:
                         status = f"{status} {pct:.0f}% of {msg['total'] / 1e9:.2f} GB"
                     job.detail = status
     finally:
-        if started:
-            # A server this job started would sit idle next to a vLLM model.
+        # Leave the server alone if a model got loaded in the meantime.
+        busy = any(i.engine == "ollama" for i in INSTANCES.values()) or any(
+            j.state == "running" and j.kind == "up" and j.engine == "ollama" for j in JOBS.values()
+        )
+        if started and not busy:
             await asyncio.to_thread(_stop, "ollama")
     return f"pulled {job.model}"
 
@@ -369,66 +687,70 @@ async def _pull_hf(job: Job) -> str:
     return f"pulled {job.model} ({size / 1e9:.2f} GB)"
 
 
-def _others(engine: Engine) -> list[Engine]:
-    return [e for e in ENGINES if e != engine]
-
-
-async def _up_ollama(job: Job) -> str:
-    await asyncio.to_thread(_stop, *_others("ollama"))
+async def _start_ollama(job: Job, inst: Instance) -> str:
     await _ensure_ollama_server()
     job.detail = "loading into VRAM"
     async with httpx.AsyncClient(timeout=600) as client:
         resp = await client.post(
-            f"{INTERNAL['ollama']}/api/generate", json={"model": job.model, "keep_alive": -1}
+            f"{INTERNAL['ollama']}/api/generate", json={"model": inst.model, "keep_alive": -1}
         )
         if resp.status_code != 200:
-            raise RuntimeError(f"ollama could not load {job.model}: {resp.text[:500]}")
-    return f"{job.model} is up at {PUBLIC['ollama']}"
+            raise RuntimeError(f"ollama could not load {inst.model}: {resp.text[:500]}")
+    STORE.manage(inst.model, True)
+    inst.managed = True
+    loaded = next((m for m in await _ollama_ps() if (m.get("name") or m.get("model")) == inst.model), None)
+    if loaded:
+        inst.vram_mib = round(loaded.get("size_vram", 0) / 2**20) + vram.OLLAMA_OVERHEAD_MIB
+        inst.vram_source = "ollama_ps"
+        inst.cpu_offload = loaded.get("size_vram", 0) < loaded.get("size", 0)
+        STORE.record(inst.record_key, inst.vram_mib)
+    return f"{inst.model} is up at {PUBLIC['ollama']}"
 
 
-async def _up_vllm(job: Job, max_model_len: int, gpu_memory_utilization: float) -> str:
-    await asyncio.to_thread(_stop, *_others("vllm"))
-    env = {
-        "VLLM_MODEL": job.model,
-        "VLLM_MAX_LEN": str(max_model_len),
-        "VLLM_GPU_UTIL": str(gpu_memory_utilization),
-    }
-    await asyncio.to_thread(_run, "up", "-d", "--force-recreate", "vllm", env=env)
-    job.detail = "starting (weights, compile, warmup)"
+def _start_vllm(cfg: dict[str, Any]) -> Any:
+    async def start(job: Job, inst: Instance) -> str:
+        total = _total() or 1
+        # vLLM refuses to start unless util x card is free; with --kv-cache-memory
+        # that check is all util still does, so ask for exactly the budgeted need.
+        util = min(0.95, math.ceil(inst.vram_mib / total * 1000) / 1000)
+        env = {
+            "VLLM_MODEL": inst.model,
+            "VLLM_MAX_LEN": str(cfg["max_len"]),
+            "VLLM_GPU_UTIL": str(util),
+            "VLLM_KV_BYTES": str(cfg["kv"]),
+        }
+        await asyncio.to_thread(_run, "up", "-d", "--force-recreate", "vllm", env=env)
+        job.detail = "starting (weights, compile, warmup)"
 
-    def alive() -> bool:
-        return "vllm" in _running()
+        def alive() -> bool:
+            return "vllm" in _running()
 
-    if await _wait_http(f"{INTERNAL['vllm']}/v1/models", VLLM_STARTUP_SECS, alive):
-        return f"{job.model} is up at {PUBLIC['vllm']}"
-    tail = await asyncio.to_thread(_run, "logs", "--no-log-prefix", "--tail", "40", "vllm")
-    raise RuntimeError(f"vLLM did not become ready. Last log lines:\n{tail}")
+        if await _wait_http(f"{INTERNAL['vllm']}/v1/models", VLLM_STARTUP_SECS, alive):
+            return f"{inst.model} is up at {PUBLIC['vllm']}"
+        tail = await asyncio.to_thread(_run, "logs", "--no-log-prefix", "--tail", "40", "vllm")
+        with contextlib.suppress(RuntimeError):
+            await asyncio.to_thread(_stop, "vllm")
+        raise RuntimeError(f"vLLM did not become ready. Last log lines:\n{tail}")
+
+    return start
 
 
-def _check_nemo_repo(model: str) -> None:
-    if not NEMO_REPO.fullmatch(model):
-        raise ToolError(f"nemo only loads Hugging Face repos named nvidia/<name>, not {model}")
-
-
-async def _up_nemo(job: Job) -> str:
-    await asyncio.to_thread(_stop, *_others("nemo"))
+async def _start_nemo(job: Job, inst: Instance) -> str:
     job.detail = "building the nemo image (about 5 minutes the first time, seconds after)"
     _BUILD_CANCELLED.clear()
     await asyncio.to_thread(_build_nemo)
-    await asyncio.to_thread(_run, "up", "-d", "--force-recreate", "nemo", env={"NEMO_MODEL": job.model})
+    await asyncio.to_thread(_run, "up", "-d", "--force-recreate", "nemo", env={"NEMO_MODEL": inst.model})
     job.detail = "loading the model onto the GPU"
 
     def alive() -> bool:
         return "nemo" in _running()
 
     if await _wait_http(f"{INTERNAL['nemo']}/health", NEMO_STARTUP_SECS, alive):
-        return f"{job.model} is up; call diarize"
+        return f"{inst.model} is up; call diarize"
     tail = await asyncio.to_thread(_run, "logs", "--no-log-prefix", "--tail", "40", "nemo")
+    with contextlib.suppress(RuntimeError):
+        await asyncio.to_thread(_stop, "nemo")
     raise RuntimeError(f"nemo did not become ready. Last log lines:\n{tail}")
-
-
-def _is_whisper(model: str | None) -> bool:
-    return model is not None and "whisper" in model.lower()
 
 
 async def _audio_job(job: Job, audio_url: str, engine: str, send: Any) -> dict[str, Any]:
@@ -466,16 +788,44 @@ async def _wav_chunks(wav: Path) -> Any:
             yield chunk
 
 
-async def _diarize(job: Job, audio_url: str, mode: str) -> str:
-    async def send(client: httpx.AsyncClient, wav: Path, _: float) -> httpx.Response:
-        return await client.post(
-            f"{INTERNAL['nemo']}/diarize",
-            params={"mode": mode},
-            content=_wav_chunks(wav),
-            headers={"Content-Type": "audio/wav"},
-        )
+async def _reserve_burst(job: Job, mib: int, evict: str) -> None:
+    """Hold mib on top of the job's instance for as long as the job runs."""
+    async with PLACEMENT:
+        await _reconcile()
+        plan = _plan(mib, {job.instance or ""}, [])
+        if not plan.can_fit or (not plan.fits and evict != "auto"):
+            job.result = _refusal(plan)
+            raise RuntimeError(plan.reason or f"the {mib} MiB this job needs does not fit")
+        for key in plan.evict:
+            job.detail = f"stopping {key} to make room"
+            await _evict(key)
+        BURSTS[job.id] = mib
+
+
+async def _diarize(job: Job, audio_url: str, mode: str, evict: str) -> str:
+    reserved_burst: dict[str, int] = {}
+
+    async def send(client: httpx.AsyncClient, wav: Path, audio_s: float) -> httpx.Response:
+        job.detail = "waiting for the nemo engine"
+        async with _queue(job.instance or "nemo", 1):
+            burst = vram.nemo_burst_mib(audio_s, STORE.burst_rate(job.model))
+            await _reserve_burst(job, burst, evict)
+            reserved_burst["mib"] = burst
+            job.detail = f"diarizing {audio_s / 60:.0f} min of audio"
+            try:
+                return await client.post(
+                    f"{INTERNAL['nemo']}/diarize",
+                    params={"mode": mode},
+                    content=_wav_chunks(wav),
+                    headers={"Content-Type": "audio/wav"},
+                )
+            finally:
+                BURSTS.pop(job.id, None)
 
     body = await _audio_job(job, audio_url, "nemo", send)
+    if body.get("burst_mib") and body.get("audio_s"):
+        STORE.record_burst(job.model, body["burst_mib"] / (body["audio_s"] / 60))
+    body["reserved_burst_mib"] = reserved_burst.get("mib")
     job.result = body
     speakers = ", ".join(f"{s['speaker']} {s['seconds']:.0f} s" for s in body["speakers"]) or "no speech"
     return f"{len(body['speakers'])} speakers in {body['audio_s']:.0f} s of audio: {speakers}"
@@ -492,19 +842,22 @@ async def _transcribe(job: Job, audio_url: str, language: str, traditional: bool
 
     async def send(client: httpx.AsyncClient, wav: Path, audio_s: float) -> httpx.Response:
         timing["audio_s"] = audio_s
-        started = time.monotonic()
-        with wav.open("rb") as f:
-            resp = await client.post(
-                f"{INTERNAL['vllm']}/v1/audio/transcriptions",
-                data={
-                    "model": job.model,
-                    "language": code,
-                    "response_format": "verbose_json",
-                    "temperature": "0",
-                },
-                files={"file": ("audio.wav", f, "audio/wav")},
-            )
-        timing["elapsed_s"] = time.monotonic() - started
+        job.detail = "waiting for the vllm engine"
+        async with _queue(job.instance or "vllm", TRANSCRIBE_CONCURRENCY):
+            job.detail = f"transcribing {audio_s / 60:.0f} min of audio"
+            started = time.monotonic()
+            with wav.open("rb") as f:
+                resp = await client.post(
+                    f"{INTERNAL['vllm']}/v1/audio/transcriptions",
+                    data={
+                        "model": job.model,
+                        "language": code,
+                        "response_format": "verbose_json",
+                        "temperature": "0",
+                    },
+                    files={"file": ("audio.wav", f, "audio/wav")},
+                )
+            timing["elapsed_s"] = time.monotonic() - started
         return resp
 
     body = await _audio_job(job, audio_url, "vllm", send)
@@ -530,55 +883,90 @@ async def _transcribe(job: Job, audio_url: str, language: str, traditional: bool
 # ---------------------------------------------------------------- tools
 
 
+def _iso(ts: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
 @mcp.tool()
 async def status() -> dict[str, Any]:
-    """What is running now: the engine and model that are up, their OpenAI compatible
-    base_url, GPU memory, and jobs still in progress. Call this first."""
+    """What is running now: one entry per model that is up (engine, OpenAI compatible
+    base_url, vram_mib and where that number comes from, pinned, last_used, its jobs),
+    the GPU budget (budget_mib, reserved_mib, free_mib, pressure) and jobs in progress.
+    Call this first."""
+    _ensure_reconciler()
+    await _reconcile()
     running = await asyncio.to_thread(_running)
     up = []
-    if "ollama" in running:
-        loaded = []
-        try:
-            async with httpx.AsyncClient(timeout=5) as client:
-                ps = (await client.get(f"{INTERNAL['ollama']}/api/ps")).json()
-            loaded = [m["name"] for m in ps.get("models", [])]
-        except httpx.HTTPError:
-            pass
-        up.append({"engine": "ollama", "models": loaded, "base_url": PUBLIC["ollama"]})
-    if "vllm" in running:
-        ready = await _wait_http(f"{INTERNAL['vllm']}/v1/models", 0.1)
-        up.append(
-            {
-                "engine": "vllm",
-                "models": [await asyncio.to_thread(_vllm_model_from_container)],
-                "ready": ready,
-                "base_url": PUBLIC["vllm"],
-            }
-        )
-    if "nemo" in running:
-        up.append(
-            {
-                "engine": "nemo",
-                "models": [await asyncio.to_thread(_nemo_model_from_container)],
-                "ready": await _wait_http(f"{INTERNAL['nemo']}/health", 0.1),
-                "base_url": None,
-            }
-        )
-    return {
-        "up": up,
-        "gpu": await asyncio.to_thread(_gpu),
-        "jobs": [j.view() for j in JOBS.values() if j.state == "running"],
-    }
+    for inst in sorted(INSTANCES.values(), key=lambda i: i.key):
+        if inst.engine == "vllm":
+            ready = not inst.starting and await _wait_http(f"{INTERNAL['vllm']}/v1/models", 0.1)
+        elif inst.engine == "nemo":
+            ready = not inst.starting and await _wait_http(f"{INTERNAL['nemo']}/health", 0.1)
+        else:
+            ready = not inst.starting
+        entry = {
+            "engine": inst.engine,
+            "model": inst.model,
+            "models": [inst.model],
+            "base_url": PUBLIC.get(inst.engine),
+            "ready": ready,
+            "vram_mib": inst.vram_mib,
+            "vram_source": inst.vram_source,
+            "pinned": STORE.pinned(inst.key),
+            "last_used": _iso(inst.last_used),
+            "jobs": [j.id for j in _jobs_of(inst.key)],
+        }
+        if inst.engine == "ollama":
+            entry["managed"] = inst.managed
+            entry["cpu_offload"] = inst.cpu_offload
+        up.append(entry)
+    if "ollama" in running and not any(i.engine == "ollama" for i in INSTANCES.values()):
+        # The server is up with nothing loaded; keep the old one-entry shape.
+        up.append({"engine": "ollama", "model": None, "models": [], "base_url": PUBLIC["ollama"],
+                   "ready": True, "vram_mib": 0, "vram_source": "ollama_ps", "pinned": False,
+                   "last_used": None, "jobs": []})
+    card = CARD["smi"]
+    gpu = None
+    if card:
+        budget = vram.budget(card["total"])
+        gpu = {
+            "name": card["name"],
+            "memory_used_mib": card["used"],
+            "memory_total_mib": card["total"],
+            "budget_mib": budget,
+            "reserved_mib": _reserved(),
+            "free_mib": budget - _reserved(),
+            "pressure": CARD["pressure"],
+            "unaccounted_mib": CARD["unaccounted_mib"],
+            # A client loaded more into Ollama than the budget allows; under WSL
+            # the driver spills it to system memory instead of failing.
+            "over_budget": _reserved() > budget,
+        }
+    return {"up": up, "gpu": gpu, "jobs": [j.view() for j in JOBS.values() if j.state == "running"]}
 
 
 @mcp.tool()
 async def model_list(engine: Engine | None = None) -> list[dict[str, Any]]:
-    """Models already downloaded on this machine, with size on disk. Filter by engine."""
+    """Models already downloaded on this machine, with size on disk, the GPU memory each
+    needs (vram_mib, vram_source) and whether it is loaded. Filter by engine."""
+    _ensure_reconciler()
+    if CARD["smi"] is None:
+        CARD["smi"] = await asyncio.to_thread(vram.smi)
     models: list[dict[str, Any]] = []
     if engine in (None, "ollama"):
         models += await asyncio.to_thread(_ollama_models)
     if engine != "ollama":
         models += [m for m in await asyncio.to_thread(_hf_models) if engine in (None, m["engine"])]
+    for m in models:
+        inst = INSTANCES.get(f"{m['engine']}:{m['model']}")
+        m["loaded"] = inst is not None
+        if inst is not None:
+            m["vram_mib"], m["vram_source"] = inst.vram_mib, inst.vram_source
+        elif m["engine"] == "vllm":
+            cfg = await asyncio.to_thread(_vllm_config, m["model"], None, None, None)
+            m["vram_mib"], m["vram_source"] = cfg["need"], cfg["source"]
+        else:
+            m["vram_mib"], m["vram_source"], _ = await asyncio.to_thread(_simple_need, m["engine"], m["model"], None)
     return models
 
 
@@ -587,6 +975,7 @@ async def model_pull(engine: Engine, model: str) -> dict[str, Any]:
     """Download a model. ollama takes library names like qwen3:8b; vllm and nemo take Hugging
     Face repo ids like Qwen/Qwen3-0.6B or nvidia/Nemotron-3-Diarization. Returns a job;
     poll job_status."""
+    _ensure_reconciler()
     if engine == "nemo":
         _check_nemo_repo(model)
     work = _pull_ollama if engine == "ollama" else _pull_hf
@@ -599,50 +988,154 @@ async def model_up(
     model: str,
     max_model_len: int | None = None,
     gpu_memory_utilization: float | None = None,
+    vram_mib: int | None = None,
+    pin: bool | None = None,
+    evict: Evict = "never",
+    dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Load a model so it serves requests, stopping any other engine first. The two
-    tuning arguments apply to vllm only; left out, they are 8192 and 0.8, or 448 and 0.4
-    for a Whisper model. vLLM startup takes 40 s to several minutes; the first nemo start
-    builds its image and takes about 5 minutes.
-    Returns a job; when it is done, status shows the base_url (nemo has none: use diarize)."""
-    job = Job("up", engine, model)
-    if engine == "ollama":
-        return _start_job(job, _up_ollama)
+    """Load a model so it serves requests, next to whatever else fits on the GPU.
+
+    Admission: the models already up plus this one must fit the VRAM budget. If it
+    does not, nothing happens and the reply is a plan {refused, fits, need_mib,
+    free_mib, evict: [...]}; call again with evict="auto" to stop the models in evict
+    (least recently used first, never pinned ones or ones running a job). dry_run
+    returns the plan without doing anything. vram_mib declares the need of a model
+    aias has not measured yet. pin=true keeps it from being evicted (false unpins).
+    vllm holds one model: asking for another replaces it. max_model_len and
+    gpu_memory_utilization apply to vllm only; left out, they are 8192 and 0.8, or 448
+    and 0.4 for a Whisper model. vLLM startup takes 40 s to several minutes; the first
+    nemo start builds its image and takes about 5 minutes. Returns a job; when it is
+    done, status shows the base_url (nemo has none: use diarize)."""
+    _ensure_reconciler()
+    await _reconcile()
     if engine == "nemo":
         _check_nemo_repo(model)
-        return _start_job(job, _up_nemo)
-    defaults = WHISPER_DEFAULTS if _is_whisper(model) else VLLM_DEFAULTS
-    max_len = max_model_len or defaults["max_model_len"]
-    util = gpu_memory_utilization or defaults["gpu_memory_utilization"]
-    return _start_job(job, lambda j: _up_vllm(j, max_len, util))
+    if engine == "ollama":
+        model = _ollama_name(model)
+    if engine == "vllm":
+        cfg = await asyncio.to_thread(_vllm_config, model, max_model_len, gpu_memory_utilization, vram_mib)
+        need, source, record_key = cfg["need"], cfg["source"], cfg["record_key"]
+    else:
+        cfg = {}
+        need, source, record_key = await asyncio.to_thread(_simple_need, engine, model, vram_mib)
+    key = f"{engine}:{model}"
+
+    current = INSTANCES.get(key)
+    if current is not None:
+        if current.starting:
+            raise ToolError(f"{model} is already starting; follow its model_up job with job_status")
+        if pin is not None and not dry_run:
+            STORE.pin(key, pin)
+        if engine == "ollama" and not current.managed and not dry_run:
+            # A client loaded it; take it over so it stays loaded.
+            job = Job("up", engine, model, instance=key)
+            return _start_job(job, lambda j: _start_ollama(j, current))
+        return {"already_up": True, "model": model, "engine": engine, "vram_mib": current.vram_mib,
+                "pinned": STORE.pinned(key)}
+
+    replace: list[str] = []
+    if engine in ("vllm", "nemo"):
+        for other in [i for i in INSTANCES.values() if i.engine == engine]:
+            if STORE.pinned(other.key) or _jobs_of(other.key) or other.starting:
+                raise ToolError(
+                    f"{engine} holds {other.model}, which is pinned, starting or running a job; "
+                    f"model_down model={other.model} first"
+                )
+            replace.append(other.key)
+    plan = _plan(need, {key}, replace)
+    if dry_run:
+        return {"dry_run": True, "model": model, "engine": engine, "vram_source": source, **plan.view()}
+    if not plan.can_fit or (not plan.fits and evict != "auto"):
+        return {"model": model, "engine": engine, "vram_source": source, **_refusal(plan)}
+
+    inst = Instance(engine, model, need, source, record_key)
+    start = _start_ollama if engine == "ollama" else _start_nemo if engine == "nemo" else _start_vllm(cfg)
+
+    async def work(job: Job) -> str:
+        detail = await _place(job, inst, evict, replace, start)
+        if pin:
+            STORE.pin(key, True)
+        return detail
+
+    return _start_job(Job("up", engine, model, instance=key), work)
+
+
+def _cancel(jobs: list[Job]) -> list[asyncio.Task]:
+    tasks = []
+    for job in jobs:
+        if job.task is not None and not job.task.done():
+            if job.kind == "up" and job.engine == "nemo":
+                # A build holds the compose lock for minutes; end it so _stop gets the lock.
+                _cancel_build()
+            job.task.cancel()
+            tasks.append(job.task)
+    return tasks
 
 
 @mcp.tool()
-async def model_down() -> dict[str, Any]:
-    """Stop every engine and free the GPU. Cancels a pull, up, diarize or transcribe job that
-    is still running."""
-    if (job := _busy()) is not None and job.task is not None:
-        job.task.cancel()
-        # A build holds the compose lock for minutes; end it so _stop gets the lock.
+async def model_down(model: str | None = None) -> dict[str, Any]:
+    """Stop models and free their GPU memory. With model, stop only that one (pinned or
+    not) and cancel only its jobs. Without, stop every engine and cancel every pull, up,
+    diarize or transcribe job, as before."""
+    _ensure_reconciler()
+    if model is None:
+        tasks = _cancel([j for j in JOBS.values() if j.state == "running"])
         _cancel_build()
-        await asyncio.wait({job.task}, timeout=30)
-    await asyncio.to_thread(_stop, *ENGINES)
-    return {"stopped": list(ENGINES), "gpu": await asyncio.to_thread(_gpu)}
+        if tasks:
+            await asyncio.wait(tasks, timeout=30)
+        await asyncio.to_thread(_stop, *ENGINES)
+        for inst in list(INSTANCES.values()):
+            STORE.pin(inst.key, False)
+            if inst.engine == "ollama":
+                STORE.manage(inst.model, False)
+        INSTANCES.clear()
+        BURSTS.clear()
+        CARD["smi"] = await asyncio.to_thread(vram.smi)
+        return {"stopped": list(ENGINES), "gpu": _gpu_view()}
+    await _reconcile()
+    names = {model, _ollama_name(model)}
+    targets = [i for i in INSTANCES.values() if i.model in names]
+    if not targets:
+        raise ToolError(f"{model} is not up; status lists what is")
+    tasks = _cancel([j for j in JOBS.values() if j.state == "running" and j.instance in {i.key for i in targets}])
+    if tasks:
+        await asyncio.wait(tasks, timeout=30)
+    for inst in targets:
+        await _evict(inst.key)
+    CARD["smi"] = await asyncio.to_thread(vram.smi)
+    return {"stopped": [i.key for i in targets], "gpu": _gpu_view()}
+
+
+def _gpu_view() -> dict[str, Any] | None:
+    card = CARD["smi"]
+    if not card:
+        return None
+    return {"name": card["name"], "memory_used_mib": card["used"], "memory_total_mib": card["total"]}
+
+
+def _up_instance(engine: Engine, check: Any) -> Instance | None:
+    inst = next((i for i in INSTANCES.values() if i.engine == engine and check(i.model)), None)
+    return None if inst is None or inst.starting else inst
 
 
 @mcp.tool()
-async def diarize(audio_url: str, mode: Mode = "offline") -> dict[str, Any]:
+async def diarize(audio_url: str, mode: Mode = "offline", evict: Evict = "never") -> dict[str, Any]:
     """Label who spoke when in an audio file, up to 8 speakers, with the nemo engine
     (model_up engine=nemo first). audio_url is an http(s) link the server downloads; any
     format ffmpeg reads, up to 2 GB. mode trades accuracy for latency: offline (best),
     low (1.04 s), verylow (0.64 s), ultralow (0.32 s); the streaming modes are slower on
-    a whole file. Returns a job; when it is done, job_status carries result with the
-    RTTM text and the seconds each speaker talked."""
-    running = await asyncio.to_thread(_running)
-    if "nemo" not in running:
+    a whole file. A run needs about 40 MiB of GPU memory per minute of audio on top of
+    the model (measured after the first run); if that does not fit, the job fails with a
+    plan, and evict="auto" lets it stop least recently used models. Returns a job; when it is done, job_status carries
+    result with the RTTM text and the seconds each speaker talked."""
+    _ensure_reconciler()
+    await _reconcile()
+    inst = _up_instance("nemo", lambda m: True)
+    if inst is None:
         raise ToolError("nemo is not up: run model_up engine=nemo model=nvidia/Nemotron-3-Diarization first")
-    model = await asyncio.to_thread(_nemo_model_from_container) or "nemo"
-    return _start_job(Job("diarize", "nemo", model), lambda j: _diarize(j, audio_url, mode))
+    job = Job("diarize", "nemo", inst.model, instance=inst.key)
+    inst.last_used = time.time()
+    return _start_job(job, lambda j: _diarize(j, audio_url, mode, evict))
 
 
 @mcp.tool()
@@ -652,25 +1145,30 @@ async def transcribe(audio_url: str, language: str = "zh", traditional: bool = T
     downloads; any format ffmpeg reads, up to 2 GB and 2 hours. language is an ISO 639-1
     code; a tag like zh-TW or zh_CN is cut to zh. traditional converts simplified Chinese
     characters to traditional (Taiwan), because Whisper drifts to simplified; it applies
-    only to zh. Returns a job; when it is done, job_status carries result with the full
-    text and segments (start, end, text) in seconds."""
-    running = await asyncio.to_thread(_running)
-    model = await asyncio.to_thread(_vllm_model_from_container) if "vllm" in running else None
-    if not _is_whisper(model):
+    only to zh. Several transcriptions run at once. Returns a job; when it is done,
+    job_status carries result with the full text and segments (start, end, text) in
+    seconds."""
+    _ensure_reconciler()
+    await _reconcile()
+    inst = _up_instance("vllm", _is_whisper)
+    if inst is None:
         raise ToolError(
             "no Whisper model is up: run model_up engine=vllm model=openai/whisper-large-v3 first"
         )
     if not await _wait_http(f"{INTERNAL['vllm']}/v1/models", 0.1):
-        raise ToolError(f"{model} is still starting; wait for its model_up job to finish")
+        raise ToolError(f"{inst.model} is still starting; wait for its model_up job to finish")
+    inst.last_used = time.time()
     return _start_job(
-        Job("transcribe", "vllm", model), lambda j: _transcribe(j, audio_url, language, traditional)
+        Job("transcribe", "vllm", inst.model, instance=inst.key),
+        lambda j: _transcribe(j, audio_url, language, traditional),
     )
 
 
 @mcp.tool()
 async def job_status(job_id: str, wait_seconds: int = 30) -> dict[str, Any]:
     """Progress of a pull, up, diarize or transcribe job. Blocks up to wait_seconds (max 120)
-    for it to finish. A finished diarize or transcribe job carries its output in result."""
+    for it to finish. A finished diarize or transcribe job carries its output in result;
+    a refused one carries the plan."""
     job = JOBS.get(job_id)
     if job is None:
         raise ToolError(f"no job {job_id}; jobs do not survive a server restart")
@@ -688,6 +1186,7 @@ async def logs(engine: Engine, lines: int = 100) -> str:
 
 @mcp.custom_route("/health", methods=["GET"])
 async def health(_: Request) -> JSONResponse:
+    _ensure_reconciler()
     return JSONResponse({"ok": True})
 
 

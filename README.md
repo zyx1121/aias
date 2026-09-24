@@ -57,12 +57,12 @@ Any other MCP client:
 
 | Tool | Description |
 |------|-------------|
-| `status` | The engine and model that are up, their base URL, GPU memory, running jobs |
-| `model_list` | Models already on disk, per engine, with size |
+| `status` | Each model that is up (base URL, VRAM and its source, pinned, last used, jobs), the VRAM budget, running jobs |
+| `model_list` | Models already on disk, per engine, with size, the VRAM each needs, and whether it is loaded |
 | `model_pull` | Download an Ollama model (`qwen3:8b`) or a Hugging Face repo for vLLM (`Qwen/Qwen3-0.6B`) or nemo (`nvidia/Nemotron-3-Diarization`); returns a job |
-| `model_up` | Load a model and stop any other engine; picks Whisper's memory settings by itself; returns a job |
-| `model_down` | Stop every engine and free the GPU; cancels a running job |
-| `diarize` | Label who spoke when in an audio URL, up to 8 speakers; needs nemo up; returns a job |
+| `model_up` | Load a model next to the others if it fits the VRAM budget; otherwise return a plan (`evict: "auto"` carries it out, `dry_run` only shows it); `pin` keeps a model from eviction; returns a job |
+| `model_down` | Stop one model (`model`), or every engine and job when called without one |
+| `diarize` | Label who spoke when in an audio URL, up to 8 speakers; needs nemo up; reserves its extra VRAM per file; returns a job |
 | `transcribe` | Speech to text with segment timestamps from an audio URL; needs Whisper up on vLLM; returns a job |
 | `job_status` | Progress of a pull, up, diarize or transcribe job; waits up to 120 s for it to finish; a done diarize or transcribe job carries its output |
 | `logs` | Recent log lines of an engine |
@@ -74,8 +74,33 @@ Any other MCP client:
 | "What models do I have?" | `model_list {}` |
 | "Get qwen3:8b and load it" | `model_pull { engine: "ollama", model: "qwen3:8b" }`, then `model_up` |
 | "Free the GPU" | `model_down {}` |
+| "Unload qwen3:8b, keep the rest" | `model_down { model: "qwen3:8b" }` |
+| "Would Llama 8B fit next to Whisper?" | `model_up { engine: "ollama", model: "llama3.1:8b", dry_run: true }` |
 | "Who speaks when in this recording?" | `model_up { engine: "nemo", model: "nvidia/Nemotron-3-Diarization" }`, then `diarize { audio_url: "https://..." }` |
 | "Transcribe this recording" | `model_up { engine: "vllm", model: "openai/whisper-large-v3" }`, then `transcribe { audio_url: "https://..." }` |
+
+## Sharing the GPU
+
+Several models stay up at once: one Ollama server with any number of models, one vLLM model and one nemo model. aias keeps a ledger of what each holds and admits a new model only when
+
+- the ledger plus the new need fits the budget: card memory − 1024 MiB for the desktop − 512 MiB margin (8704 MiB on a 10 GB card; `AIAS_DESKTOP_RESERVE_MIB` and `AIAS_SAFETY_MIB` override them), and
+- nvidia-smi shows at least the need + 512 MiB free.
+
+The ledger decides, not nvidia-smi: under WSL an overcommitted card does not fail, the driver quietly moves memory to system RAM and everything slows down.
+
+| Need of | Comes from, first that exists |
+|---------|-------------------------------|
+| any model | a measurement: nvidia-smi before and after its first start with no other job running, kept in the `aias-state` volume |
+| any model | `vram_mib` passed to `model_up` |
+| vLLM | `gpu_memory_utilization` x card: 0.4 for Whisper, 0.8 otherwise |
+| Ollama | what `/api/ps` reports once loaded, + 250 MiB; before that the model file + 250 MiB |
+| nemo | 1300 MiB, plus a per-file reservation during `diarize`: the highest measured MiB per minute of audio (about 39), or 43 before the first run |
+
+vLLM normally sizes its KV cache from whatever is free on the card, so next to another engine it would take a different amount each time. aias passes `--kv-cache-memory` instead (450 MB for Whisper; for other models the budget left after the weights and 1.5 GiB of overhead), so an instance takes what it was budgeted for.
+
+When a model does not fit, `model_up` changes nothing and returns `{refused, fits, need_mib, free_mib, evict}`. `evict` lists the least recently used models that would have to stop, never pinned ones or ones running a job; pass `evict: "auto"` to stop them. If even that is not enough, `evict` is empty and the reason says so. vLLM and nemo hold one model each, so asking for a different one replaces it (unless it is pinned or busy).
+
+Every 10 s aias compares nvidia-smi with the ledger. If more is in use than the ledger and the desktop reserve explain, `status` shows `pressure: true` and new models are refused until it clears; nothing running is stopped. `over_budget` means clients loaded more into Ollama directly than the budget allows, and `cpu_offload` on an Ollama model means Ollama itself put part of it in system memory.
 
 ## Audio input
 
@@ -124,7 +149,7 @@ vLLM splits long audio into clips of up to 30 s by itself. The finished job's `r
 
 ## How it works
 
-Setup imports Ubuntu 24.04 as a WSL distro named `aias` under `C:\ProgramData\aias`, and a scheduled task keeps it running from boot. Inside it, Docker Compose runs the MCP server permanently and starts Ollama, vLLM or nemo on demand, one at a time. The MCP server fetches and decodes audio itself, so the engines never see a URL. Every port is published on 127.0.0.1 only, and the MCP server rejects requests whose Host header is not local, so nothing is reachable from the network.
+Setup imports Ubuntu 24.04 as a WSL distro named `aias` under `C:\ProgramData\aias`, and a scheduled task keeps it running from boot. Inside it, Docker Compose runs the MCP server permanently and starts Ollama, vLLM and nemo on demand, side by side within the VRAM budget. The MCP server fetches and decodes audio itself, so the engines never see a URL. Every port is published on 127.0.0.1 only, and the MCP server rejects requests whose Host header is not local, so nothing is reachable from the network.
 
 | Endpoint | Serves |
 |----------|--------|
@@ -137,7 +162,8 @@ nemo has no port of its own: only the MCP server talks to it.
 ## Limitations
 
 - NVIDIA only: vLLM and the container toolkit need CUDA.
-- One model at a time: a consumer GPU cannot hold two. The diarization model and Whisper each count as one, so transcribing and diarizing the same recording means two model_up calls.
+- One vLLM model at a time (plus one nemo model and any number of Ollama models).
+- Models loaded into Ollama by other clients are tracked but not admitted: they can push the ledger past the budget (`over_budget`).
 - `diarize` and `transcribe` take a public URL, not a local file or a LAN address: upload the recording somewhere reachable from the internet first.
 - `transcribe` has no speaker labels; match its segments against a `diarize` RTTM by time.
 - Docker must not run in another WSL distro at the same time, because all WSL2 distros share one network namespace. Setup checks and stops if it does.

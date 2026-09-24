@@ -1,7 +1,7 @@
 # aias stack inside the `aias` WSL distro, installed to /opt/aias.
 # `docker compose up -d` starts only the MCP server. The engines sit in the
-# `engine` profile and are started by the MCP tools, one at a time, because a
-# single consumer GPU cannot hold two models.
+# `engine` profile and are started by the MCP tools, which admit each model
+# against a VRAM budget so several share the card.
 name: aias
 
 services:
@@ -14,11 +14,16 @@ services:
     environment:
       NVIDIA_DRIVER_CAPABILITIES: utility
       AIAS_COMPOSE: /opt/aias/compose.yaml
+      # VRAM budget = card - desktop reserve - safety margin (mcp/vram.py).
+      AIAS_DESKTOP_RESERVE_MIB: ${AIAS_DESKTOP_RESERVE_MIB:-1024}
+      AIAS_SAFETY_MIB: ${AIAS_SAFETY_MIB:-512}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /opt/aias:/opt/aias:ro
       - hf-cache:/root/.cache/huggingface
       - ollama:/ollama:ro
+      # Measured model footprints, pins and which Ollama models aias loaded.
+      - aias-state:/state
 
   ollama:
     image: ollama/ollama:0.32.15
@@ -31,6 +36,8 @@ services:
       OLLAMA_CONTEXT_LENGTH: "32768"
       OLLAMA_FLASH_ATTENTION: "1"
       OLLAMA_KV_CACHE_TYPE: q8_0
+      # aias decides what fits; Ollama must not unload models on its own count.
+      OLLAMA_MAX_LOADED_MODELS: "16"
 
   vllm:
     image: vllm/vllm-openai:v0.30.0
@@ -54,6 +61,9 @@ services:
       - --model=${VLLM_MODEL:-Qwen/Qwen3-0.6B}
       - --max-model-len=${VLLM_MAX_LEN:-8192}
       - --gpu-memory-utilization=${VLLM_GPU_UTIL:-0.8}
+      # A fixed KV cache, so the instance takes the same memory next to other
+      # engines as alone (see mcp/server.py).
+      - --kv-cache-memory=${VLLM_KV_BYTES:-4294967296}
 
   # Speaker diarization. Built on first use (about 11 GB), not at install.
   # No published port: the MCP server calls it on the compose network.
@@ -69,6 +79,7 @@ services:
       - nemo-cache:/cache
 
 volumes:
+  aias-state:
   hf-cache:
   vllm-cache:
   nemo-cache:
