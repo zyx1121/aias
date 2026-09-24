@@ -63,7 +63,7 @@ Any other MCP client:
 | `model_up` | Load a model next to the others if it fits the VRAM budget; otherwise return a plan (`evict: "auto"` carries it out, `dry_run` only shows it); `pin` keeps a model from eviction; returns a job |
 | `model_down` | Stop one model (`model`), or every engine and job when called without one |
 | `diarize` | Label who spoke when in an audio URL, up to 8 speakers; needs nemo up; reserves its extra VRAM per file; returns a job |
-| `transcribe` | Speech to text with segment timestamps from an audio URL; needs Whisper up on vLLM; returns a job |
+| `transcribe` | Speech to text with segment timestamps from an audio URL; needs Whisper up on vLLM; `diarize: true` also labels speakers (needs nemo up too); returns a job |
 | `job_status` | Progress of a pull, up, diarize or transcribe job; waits up to 120 s for it to finish; a done diarize or transcribe job carries its output |
 | `logs` | Recent log lines of an engine |
 
@@ -78,6 +78,7 @@ Any other MCP client:
 | "Would Llama 8B fit next to Whisper?" | `model_up { engine: "ollama", model: "llama3.1:8b", dry_run: true }` |
 | "Who speaks when in this recording?" | `model_up { engine: "nemo", model: "nvidia/Nemotron-3-Diarization" }`, then `diarize { audio_url: "https://..." }` |
 | "Transcribe this recording" | `model_up { engine: "vllm", model: "openai/whisper-large-v3" }`, then `transcribe { audio_url: "https://..." }` |
+| "Who said what in this meeting?" | `model_up` Whisper and nemo, then `transcribe { audio_url: "https://...", diarize: true }` |
 
 ## Sharing the GPU
 
@@ -94,7 +95,7 @@ The ledger decides, not nvidia-smi: under WSL an overcommitted card does not fai
 | any model | a measurement: nvidia-smi before and after a start with no other job running and nothing stopped for it, kept in the `aias-state` volume |
 | vLLM | `gpu_memory_utilization` x card: 0.4 for Whisper, 0.8 otherwise |
 | Ollama | what `/api/ps` reports once loaded, + 250 MiB; before that the model file + its KV cache at the 32k context (layers, KV heads and head size from `/api/show`) + 250 MiB, or twice the file if the metadata is missing |
-| nemo | 1300 MiB, plus a per-file reservation during `diarize`: the highest measured MiB per minute of audio (about 39), or 43 before the first run |
+| nemo | 1300 MiB, plus a per-file reservation during `diarize`: the highest MiB per minute measured on a file of 10 minutes or more (about 39), or 43 before such a run, and at least 128 MiB |
 
 vLLM normally sizes its KV cache from whatever is free on the card, so next to another engine it would take a different amount each time. aias passes `--kv-cache-memory` instead (450 MB for Whisper; for other models the budget left after the weights of the current revision and 1.5 GiB of overhead), so an instance takes what it was budgeted for. If that KV cache cannot hold one `max_model_len` sequence (layers, KV heads and head size from the model's `config.json`), `model_up` refuses and says which `vram_mib` would.
 
@@ -146,6 +147,20 @@ Peak GPU memory in offline mode grows with length: 0.75 GB for 10 minutes, 3.5 G
 Whisper drifts from traditional to simplified Chinese after about 30 seconds, hence `traditional`. It converts characters only; it does not swap words such as 軟件 for 軟體, so the text stays what was said.
 
 vLLM splits long audio into clips of up to 30 s by itself. The finished job's `result` holds `text` (the whole transcript), `segments` (each with `start`, `end` in seconds and `text`), `audio_s` and `elapsed_s`.
+
+### Transcript with speakers
+
+`transcribe` with `diarize: true` decodes the audio once and sends the same WAV to Whisper and to nemo (offline mode) at the same time. Both models must already be up; the error names the `model_up` that is missing. The diarization's GPU reservation follows the same rule as `diarize` (refused with a plan unless `evict: "auto"`).
+
+Each Whisper segment gets the speaker who talks the most during it:
+
+| Field | Meaning |
+|-------|---------|
+| `speaker` | Label from the diarization (`speaker_0`, ...), or null if nobody was labelled during the segment |
+| `speaker_confidence` | Share of the segment that speaker talks, 0 to 1 |
+| `speaker_uncertain` | True when that share is under 0.3, or a second speaker talks 0.3 or more of it (the segment straddles a change) |
+
+Segments are not split: Whisper cuts on pauses, and a split at a guessed word boundary would be less reliable than the flag. The result also holds `speakers` (seconds from the diarization and segments per speaker), `turns` (adjacent segments of one speaker merged, with `start`, `end`, `text`), the `rttm`, and `transcribe_s` / `diarize_s` next to `elapsed_s`.
 
 ## How it works
 
