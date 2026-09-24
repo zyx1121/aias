@@ -117,11 +117,41 @@ class NemoBurst(unittest.TestCase):
         burst = vram.nemo_burst_mib(5203, None)
         self.assertEqual(burst, 3469)
         self.assertLessEqual(4187 + 843 + burst, BUDGET)
-        self.assertEqual(round(vram.diarize_minutes(BUDGET - 4187 - 843, None), 1), 91.8)
+        self.assertEqual(vram.diarize_capacity_min(None, BUDGET, 4187 + 843, None, False, 120), 91.8)
 
     def test_floor(self):
         self.assertEqual(vram.nemo_burst_mib(5, 39.2), vram.NEMO_BURST_FLOOR_MIB)
-        self.assertEqual(vram.nemo_burst_mib(5203, 39.2), 3399)
+        self.assertEqual(vram.nemo_burst_mib(5203, 39.2), 3400)  # rounded up
+
+
+class DiarizeCapacity(unittest.TestCase):
+    def cap(self, reserved, rate=39.3, smi_free=None, pressure=False):
+        return vram.diarize_capacity_min(rate, BUDGET, reserved, smi_free, pressure, 120)
+
+    def admitted(self, minutes, reserved, rate=39.3, smi_free=None, pressure=False):
+        return vram.burst_admitted(minutes * 60, rate, BUDGET, reserved, smi_free, pressure)
+
+    def test_pressure_is_zero(self):
+        self.assertEqual(self.cap(843, pressure=True), 0.0)
+
+    def test_room_under_the_floor_is_zero(self):
+        # 8704 - 843 - 7761 = 100 MiB, less than the 128 MiB every run reserves.
+        self.assertEqual(self.cap(843 + 7761), 0.0)
+        self.assertFalse(self.admitted(0.1, 843 + 7761))
+
+    def test_capped_at_the_audio_limit(self):
+        self.assertEqual(self.cap(843 + 2000), 120.0)
+
+    def test_boundary_matches_admission(self):
+        for reserved, smi_free in [(843 + 4457, None), (843 + 4187, None), (843 + 4457, 3000), (843, 3000)]:
+            n = self.cap(reserved, smi_free=smi_free)
+            with self.subTest(reserved=reserved, smi_free=smi_free, n=n):
+                self.assertTrue(self.admitted(n, reserved, smi_free=smi_free))
+                self.assertFalse(self.admitted(round(n + 0.1, 1), reserved, smi_free=smi_free))
+
+    def test_rounds_down(self):
+        # 3404 MiB / 39.3 = 86.61...: 86.6, never 86.7.
+        self.assertEqual(self.cap(843 + 4457), 86.6)
 
 
 class StateFile(unittest.TestCase):

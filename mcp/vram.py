@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import math
 import logging
 import os
 import subprocess
@@ -110,16 +111,40 @@ def ollama_estimate_mib(file_mib: int, model_info: dict[str, Any] | None) -> tup
 def nemo_burst_mib(audio_s: float, measured_per_min: float | None = None) -> int:
     """Memory a diarize run adds on top of the idle engine: the highest rate seen in
     a measured run, else NEMO_BURST_MIB_PER_MIN."""
-    return max(NEMO_BURST_FLOOR_MIB, round(burst_rate(measured_per_min) * audio_s / 60))
+    # Rounded up, so a file fits exactly when rate x minutes fits.
+    return max(NEMO_BURST_FLOOR_MIB, math.ceil(burst_rate(measured_per_min) * audio_s / 60))
 
 
 def burst_rate(measured_per_min: float | None) -> float:
     return measured_per_min or NEMO_BURST_MIB_PER_MIN
 
 
-def diarize_minutes(room_mib: int, measured_per_min: float | None) -> float:
-    """Minutes of audio whose diarization burst fits in room_mib."""
-    return max(0.0, room_mib / burst_rate(measured_per_min))
+def burst_admitted(audio_s: float, measured_per_min: float | None, budget_mib: int,
+                   reserved_mib: int, smi_free_mib: int | None, pressure: bool) -> bool:
+    """Whether the diarization burst of a file this long is admitted without evicting
+    anything: the same make_plan the reservation itself goes through."""
+    need = nemo_burst_mib(audio_s, measured_per_min)
+    return make_plan(need, budget_mib, reserved_mib, smi_free_mib, pressure, []).fits
+
+
+def diarize_capacity_min(measured_per_min: float | None, budget_mib: int, reserved_mib: int,
+                         smi_free_mib: int | None, pressure: bool, max_minutes: float) -> float:
+    """Longest file, in tenths of a minute rounded down, whose burst burst_admitted
+    would take: 0 under pressure or when not even the 128 MiB floor fits. Found by
+    bisecting on burst_admitted, so it cannot drift from admission."""
+    def ok(tenths: int) -> bool:
+        return burst_admitted(tenths * 6, measured_per_min, budget_mib, reserved_mib, smi_free_mib, pressure)
+
+    lo, hi = 0, int(max_minutes * 10)  # ok(lo) holds (nothing to fit); find the last ok
+    if not ok(1):
+        return 0.0
+    if ok(hi):
+        return hi / 10
+    lo = 1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        lo, hi = (mid, hi) if ok(mid) else (lo, mid)
+    return lo / 10
 
 
 class Store:
