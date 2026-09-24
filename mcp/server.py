@@ -38,7 +38,7 @@ from starlette.responses import JSONResponse
 
 import align
 import vram
-from audio import MAX_AUDIO_SECS, AudioError, fetch_wav
+from audio import MAX_AUDIO_SECS, WORK, AudioError, fetch_wav
 
 Engine = Literal["ollama", "vllm", "nemo"]
 ENGINES: tuple[Engine, ...] = ("ollama", "vllm", "nemo")
@@ -820,7 +820,7 @@ async def _place(job: Job, inst: Instance, evict: str, start: Any) -> str:
     start it. PLACEMENT is held only to decide: what to replace or evict comes from
     the ledger as it is now, and the model is booked (a placeholder, not ready)
     before the lock is released, so the minutes a start takes do not hold up other
-    admissions. A failed or cancelled start takes its booking back. The footprint
+    admissions. A failed or cancelled start takes its booking back at once. The footprint
     is measured only when nothing else claimed or released memory meanwhile."""
     async with PLACEMENT:
         job.detail = "waiting for room on the GPU"
@@ -857,10 +857,13 @@ async def _place(job: Job, inst: Instance, evict: str, start: Any) -> str:
     try:
         detail = await start(job, inst)
     except BaseException:
-        async with PLACEMENT:
-            if INSTANCES.get(inst.key) is inst:
-                del INSTANCES[inst.key]
-                _touch()
+        # Take the booking back at once, with no await: waiting for PLACEMENT here
+        # could itself be cancelled (model_down cancels, then waits) and leave the
+        # model booked and "starting" for good. Dropping a booking only frees
+        # ledger room, so a plan being made under the lock meanwhile stays safe.
+        if INSTANCES.get(inst.key) is inst:
+            del INSTANCES[inst.key]
+            _touch()
         raise
     inst.starting = False
     inst.last_used = inst.since = time.time()
@@ -1043,7 +1046,7 @@ async def _with_audio(job: Job, audio_url: str, work: Any) -> Any:
     run work(client, wav, audio_s), which calls one engine or several."""
     try:
         async with asyncio.timeout(AUDIO_JOB_SECS):
-            with tempfile.TemporaryDirectory(prefix=AUDIO_TMP_PREFIX) as tmp:
+            with tempfile.TemporaryDirectory(prefix=AUDIO_TMP_PREFIX, dir=WORK) as tmp:
                 job.detail = "downloading and decoding the audio"
                 wav, audio_s = await fetch_wav(audio_url, Path(tmp))
                 job.detail = f"processing {audio_s / 60:.0f} min of audio"
@@ -1646,8 +1649,11 @@ async def health(_: Request) -> JSONResponse:
 
 if __name__ == "__main__":
     # Audio a previous run was working on when it stopped.
-    for leftover in Path(tempfile.gettempdir()).glob(f"{AUDIO_TMP_PREFIX}*"):
+    for leftover in Path(WORK).glob(f"{AUDIO_TMP_PREFIX}*"):
         shutil.rmtree(leftover, ignore_errors=True)
+    # Job directories are 0700 once decoded; the decoder may enter only its own.
+    with contextlib.suppress(OSError):
+        os.chmod(WORK, 0o711)
     mcp.run(
         "streamable-http",
         host="0.0.0.0",

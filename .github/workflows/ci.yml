@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - run: shellcheck wsl/bootstrap.sh
+      - run: shellcheck wsl/bootstrap.sh decoder/decode.sh
       - run: python3 -m py_compile mcp/server.py mcp/audio.py mcp/vram.py mcp/align.py nemo/server.py
       - run: python3 -m unittest discover -s mcp -v
       - run: docker compose -f wsl/compose.yaml config -q
@@ -20,6 +20,18 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: docker build -t aias-mcp mcp
+      - name: Decoder decodes and refuses a file over the limit
+        run: |
+          docker build -t aias-decoder decoder
+          mkdir -p work && chmod 777 work
+          docker run --rm -v "$PWD/work:/work" --entrypoint ffmpeg aias-decoder -loglevel error -f lavfi -i sine -t 5 /work/in.flac
+          docker run --rm --network none --read-only --cap-drop ALL --user 65534:65534 -v "$PWD/work:/work" aias-decoder \
+            /work/in.flac /work/out.wav 7200 240000000 2147483648
+          test "$(stat -c %s work/out.wav)" -gt 100000
+          set +e
+          docker run --rm --network none --read-only --cap-drop ALL --user 65534:65534 -v "$PWD/work:/work" aias-decoder \
+            /work/in.flac /work/out2.wav 3 240000000 2147483648
+          test $? -eq 3
       - run: docker run -d --name aias-mcp -p 127.0.0.1:11400:11400 aias-mcp
       - name: Health and tool list
         run: |

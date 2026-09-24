@@ -33,6 +33,8 @@ services:
       - ollama:/ollama:ro
       # Measured model footprints, pins and which Ollama models aias loaded.
       - aias-state:/state
+      # Downloaded audio and its decoded WAV, shared with the decoder.
+      - audio-work:/work
 
   ollama:
     image: ollama/ollama:0.32.15
@@ -74,6 +76,24 @@ services:
       # engines as alone (see mcp/server.py).
       - --kv-cache-memory=${VLLM_KV_BYTES:-4294967296}
 
+  # Decodes audio for the MCP server, one `compose run` per file. It sees only
+  # its job's directory under /work, has no network, cannot write elsewhere,
+  # holds no capabilities and cannot gain any.
+  decoder:
+    build: ./decoder
+    image: aias-decoder:local
+    profiles: [tool]
+    network_mode: none
+    read_only: true
+    user: "65534:65534"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 3g
+    pids_limit: 64
+    tmpfs: ["/tmp:size=64m"]
+    volumes:
+      - audio-work:/work
+
   # Speaker diarization. Built on first use (about 11 GB), not at install.
   # No published port: the MCP server calls it on the compose network.
   nemo:
@@ -89,6 +109,7 @@ services:
 
 volumes:
   aias-state:
+  audio-work:
   hf-cache:
   vllm-cache:
   nemo-cache:
