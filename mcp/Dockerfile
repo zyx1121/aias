@@ -11,6 +11,6 @@ COPY --from=docker /usr/local/libexec/docker/cli-plugins/docker-compose /usr/loc
 COPY --from=docker /usr/local/libexec/docker/cli-plugins/docker-buildx /usr/local/libexec/docker/cli-plugins/docker-buildx
 RUN pip install --no-cache-dir mcp==2.2.0 huggingface_hub==1.32.0 httpx opencc==1.4.2
 WORKDIR /app
-COPY server.py audio.py vram.py ./
+COPY server.py audio.py vram.py align.py ./
 EXPOSE 11400
 CMD ["python", "server.py"]

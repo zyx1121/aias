@@ -41,6 +41,11 @@ NEMO_BASE_MIB = int(os.environ.get("AIAS_NEMO_BASE_MIB", "1300"))
 # been measured, reserve 20 % more.
 NEMO_BURST_MIB_PER_MIN = 36
 NEMO_BURST_FACTOR = 1.2
+# Short files carry a fixed overhead that would inflate a per-minute rate
+# (a 5 s clip measured 240 MiB/min), so only runs this long set the rate,
+# and no reservation is smaller than the floor.
+NEMO_BURST_MIN_AUDIO_S = 600
+NEMO_BURST_FLOOR_MIB = 128
 
 STATE_FILE = Path(os.environ.get("AIAS_STATE", "/state")) / "vram.json"
 # Up to this many evictable models, the plan tries every subset for the fewest
@@ -106,7 +111,7 @@ def nemo_burst_mib(audio_s: float, measured_per_min: float | None = None) -> int
     """Memory a diarize run adds on top of the idle engine: the highest rate seen in
     a measured run, else the estimate with its margin."""
     rate = measured_per_min or NEMO_BURST_MIB_PER_MIN * NEMO_BURST_FACTOR
-    return round(rate * audio_s / 60)
+    return max(NEMO_BURST_FLOOR_MIB, round(rate * audio_s / 60))
 
 
 class Store:
@@ -127,7 +132,7 @@ class Store:
 
     @staticmethod
     def _defaults() -> dict[str, Any]:
-        return {"measured": {}, "burst_per_min": {}, "pins": [], "managed_ollama": []}
+        return {"measured": {}, "nemo_burst_per_min": {}, "pins": [], "managed_ollama": []}
 
     def _adopt(self, loaded: Any) -> None:
         """Take each field of the state file only if it has the right shape, so a
@@ -141,7 +146,8 @@ class Store:
 
         checks = {
             "measured": lambda v: isinstance(v, dict) and all(isinstance(k, str) and good_record(r) for k, r in v.items()),
-            "burst_per_min": lambda v: isinstance(v, dict) and all(
+            # burst_per_min, the field before, also took short files' rates; not read.
+            "nemo_burst_per_min": lambda v: isinstance(v, dict) and all(
                 isinstance(k, str) and isinstance(r, (int, float)) and r > 0 for k, r in v.items()
             ),
             "pins": lambda v: isinstance(v, list) and all(isinstance(x, str) for x in v),
@@ -173,12 +179,16 @@ class Store:
         self.save()
 
     def burst_rate(self, model: str) -> float | None:
-        return self.data["burst_per_min"].get(model)
+        return self.data["nemo_burst_per_min"].get(model)
 
-    def record_burst(self, model: str, per_min: float) -> None:
-        """Keep the highest per-minute burst seen, so a heavy file sets the bar."""
+    def record_burst(self, model: str, burst_mib: float, audio_s: float) -> None:
+        """Keep the highest per-minute burst of a long enough run, so a heavy file
+        sets the bar and a short one's fixed overhead does not."""
+        if audio_s < NEMO_BURST_MIN_AUDIO_S:
+            return
+        per_min = burst_mib / (audio_s / 60)
         if per_min > (self.burst_rate(model) or 0):
-            self.data["burst_per_min"][model] = round(per_min, 2)
+            self.data["nemo_burst_per_min"][model] = round(per_min, 2)
             self.save()
 
     def _toggle(self, name: str, item: str, on: bool) -> None:

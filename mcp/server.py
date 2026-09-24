@@ -16,6 +16,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -35,6 +36,7 @@ from pydantic import StrictInt
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+import align
 import vram
 from audio import AudioError, fetch_wav
 
@@ -75,6 +77,8 @@ MIN_KV_MIB = 512
 # Transcriptions a vLLM Whisper instance runs at once; nemo runs one diarize.
 TRANSCRIBE_CONCURRENCY = int(os.environ.get("AIAS_TRANSCRIBE_CONCURRENCY", "4"))
 RECONCILE_SECS = 10
+# Audio work directories; any left over from a previous run are removed at start.
+AUDIO_TMP_PREFIX = "aias-audio-"
 # A container list taken just before a model finished starting must not drop it.
 SETTLE_SECS = 2 * RECONCILE_SECS
 # Whisper drifts from traditional to simplified Chinese after about 30 s.
@@ -542,7 +546,10 @@ def _ensure_reconciler() -> None:
 
 
 def _jobs_of(key: str, exclude: Job | None = None) -> list[Job]:
-    return [j for j in JOBS.values() if j.state == "running" and j.instance == key and j is not exclude]
+    return [
+        j for j in JOBS.values()
+        if j.state == "running" and (j.instance == key or key in j.also) and j is not exclude
+    ]
 
 
 # Instances an admission is stopping; no job may start on them and no pin may
@@ -639,6 +646,7 @@ class Job:
     engine: Engine
     model: str
     instance: str | None = None  # the Instance key the job runs on or starts
+    also: list[str] = field(default_factory=list)  # other instances it uses (nemo for a diarized transcript)
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     state: Literal["running", "done", "error"] = "running"
     detail: str = ""
@@ -878,23 +886,26 @@ async def _start_nemo(job: Job, inst: Instance) -> str:
     raise RuntimeError(f"nemo did not become ready. Last log lines:\n{tail}")
 
 
-async def _audio_job(job: Job, audio_url: str, engine: str, send: Any) -> dict[str, Any]:
-    """Fetch audio_url as 16 kHz mono WAV (audio.py enforces every limit), then hand
-    it to send(client, wav, audio_s), which calls the engine and returns its reply."""
+async def _with_audio(job: Job, audio_url: str, work: Any) -> Any:
+    """Fetch audio_url once as 16 kHz mono WAV (audio.py enforces every limit), then
+    run work(client, wav, audio_s), which calls one engine or several."""
     try:
         async with asyncio.timeout(AUDIO_JOB_SECS):
-            with tempfile.TemporaryDirectory() as tmp:
+            with tempfile.TemporaryDirectory(prefix=AUDIO_TMP_PREFIX) as tmp:
                 job.detail = "downloading and decoding the audio"
                 wav, audio_s = await fetch_wav(audio_url, Path(tmp))
                 job.detail = f"processing {audio_s / 60:.0f} min of audio"
                 async with httpx.AsyncClient(timeout=httpx.Timeout(AUDIO_JOB_SECS, connect=10)) as client:
-                    resp = await send(client, wav, audio_s)
+                    return await work(client, wav, audio_s)
     except AudioError as exc:
         raise RuntimeError(str(exc)) from None
     except TimeoutError:
         raise RuntimeError(f"{job.kind} did not finish within {AUDIO_JOB_SECS} s") from None
     except httpx.HTTPError as exc:
-        raise RuntimeError(f"could not reach the {engine} engine: {type(exc).__name__} {exc}".rstrip()) from exc
+        raise RuntimeError(f"could not reach an engine: {type(exc).__name__} {exc}".rstrip()) from exc
+
+
+def _reply(resp: httpx.Response, engine: str) -> dict[str, Any]:
     try:
         body = resp.json()
     except ValueError:
@@ -913,11 +924,11 @@ async def _wav_chunks(wav: Path) -> Any:
             yield chunk
 
 
-async def _reserve_burst(job: Job, mib: int, evict: str) -> None:
-    """Hold mib on top of the job's instance for as long as the job runs."""
+async def _reserve_burst(job: Job, mib: int, evict: str, protect: set[str]) -> None:
+    """Hold mib on top of the job's instances for as long as the job runs."""
     async with PLACEMENT:
         await _reconcile()
-        plan = _plan(mib, {job.instance or ""}, [])
+        plan = _plan(mib, protect, [])
         if not plan.can_fit or (not plan.fits and evict != "auto"):
             job.result = _refusal(plan)
             raise RuntimeError(plan.reason or f"the {mib} MiB this job needs does not fit")
@@ -925,30 +936,52 @@ async def _reserve_burst(job: Job, mib: int, evict: str) -> None:
         BURSTS[job.id] = mib
 
 
-async def _diarize(job: Job, audio_url: str, mode: str, evict: str) -> str:
-    reserved_burst: dict[str, int] = {}
-
-    async def send(client: httpx.AsyncClient, wav: Path, audio_s: float) -> httpx.Response:
-        job.detail = "waiting for the nemo engine"
-        async with _queue(job.instance or "nemo", 1):
-            burst = vram.nemo_burst_mib(audio_s, STORE.burst_rate(job.model))
-            await _reserve_burst(job, burst, evict)
-            reserved_burst["mib"] = burst
-            job.detail = f"diarizing {audio_s / 60:.0f} min of audio"
-            try:
-                return await client.post(
-                    f"{INTERNAL['nemo']}/diarize",
-                    params={"mode": mode},
-                    content=_wav_chunks(wav),
-                    headers={"Content-Type": "audio/wav"},
-                )
-            finally:
-                BURSTS.pop(job.id, None)
-
-    body = await _audio_job(job, audio_url, "nemo", send)
+async def _run_nemo(job: Job, client: httpx.AsyncClient, wav: Path, audio_s: float,
+                    nemo: str, model: str, mode: str, evict: str) -> dict[str, Any]:
+    """One diarization on the nemo engine: queue, reserve its burst, send the WAV."""
+    job.detail = "waiting for the nemo engine"
+    async with _queue(nemo, 1):
+        burst = vram.nemo_burst_mib(audio_s, STORE.burst_rate(model))
+        await _reserve_burst(job, burst, evict, {job.instance or "", *job.also})
+        job.detail = f"diarizing {audio_s / 60:.0f} min of audio"
+        try:
+            resp = await client.post(
+                f"{INTERNAL['nemo']}/diarize",
+                params={"mode": mode},
+                content=_wav_chunks(wav),
+                headers={"Content-Type": "audio/wav"},
+            )
+        finally:
+            BURSTS.pop(job.id, None)
+    body = _reply(resp, "nemo")
     if body.get("burst_mib") and body.get("audio_s"):
-        STORE.record_burst(job.model, body["burst_mib"] / (body["audio_s"] / 60))
-    body["reserved_burst_mib"] = reserved_burst.get("mib")
+        STORE.record_burst(model, body["burst_mib"], body["audio_s"])
+    body["reserved_burst_mib"] = burst
+    return body
+
+
+async def _run_whisper(job: Job, client: httpx.AsyncClient, wav: Path, audio_s: float,
+                       vllm: str, code: str) -> tuple[dict[str, Any], float]:
+    """One transcription on vLLM. Returns the reply and the seconds it took."""
+    job.detail = "waiting for the vllm engine"
+    async with _queue(vllm, TRANSCRIBE_CONCURRENCY):
+        job.detail = f"transcribing {audio_s / 60:.0f} min of audio"
+        started = time.monotonic()
+        with wav.open("rb") as f:
+            resp = await client.post(
+                f"{INTERNAL['vllm']}/v1/audio/transcriptions",
+                data={"model": job.model, "language": code, "response_format": "verbose_json", "temperature": "0"},
+                files={"file": ("audio.wav", f, "audio/wav")},
+            )
+        elapsed = time.monotonic() - started
+    return _reply(resp, "vllm"), elapsed
+
+
+async def _diarize(job: Job, audio_url: str, mode: str, evict: str) -> str:
+    async def work(client: httpx.AsyncClient, wav: Path, audio_s: float) -> dict[str, Any]:
+        return await _run_nemo(job, client, wav, audio_s, job.instance or "nemo", job.model, mode, evict)
+
+    body = await _with_audio(job, audio_url, work)
     job.result = body
     speakers = ", ".join(f"{s['speaker']} {s['seconds']:.0f} s" for s in body["speakers"]) or "no speech"
     return f"{len(body['speakers'])} speakers in {body['audio_s']:.0f} s of audio: {speakers}"
@@ -959,31 +992,36 @@ def _whisper_language(language: str) -> str:
     return language.replace("_", "-").split("-")[0].strip().lower()
 
 
-async def _transcribe(job: Job, audio_url: str, language: str, traditional: bool) -> str:
-    timing: dict[str, float] = {}
+async def _transcribe(
+    job: Job, audio_url: str, language: str, traditional: bool,
+    diarize: dict[str, str] | None = None, evict: str = "never",
+) -> str:
+    """Whisper on vLLM; with diarize ({"instance", "model"} of nemo), nemo runs on
+    the same decoded WAV at the same time and the segments get speakers."""
     code = _whisper_language(language)
+    timing: dict[str, float] = {}
 
-    async def send(client: httpx.AsyncClient, wav: Path, audio_s: float) -> httpx.Response:
+    async def work(client: httpx.AsyncClient, wav: Path, audio_s: float) -> Any:
         timing["audio_s"] = audio_s
-        job.detail = "waiting for the vllm engine"
-        async with _queue(job.instance or "vllm", TRANSCRIBE_CONCURRENCY):
-            job.detail = f"transcribing {audio_s / 60:.0f} min of audio"
-            started = time.monotonic()
-            with wav.open("rb") as f:
-                resp = await client.post(
-                    f"{INTERNAL['vllm']}/v1/audio/transcriptions",
-                    data={
-                        "model": job.model,
-                        "language": code,
-                        "response_format": "verbose_json",
-                        "temperature": "0",
-                    },
-                    files={"file": ("audio.wav", f, "audio/wav")},
+        started = time.monotonic()
+        if diarize is None:
+            body, timing["transcribe_s"] = await _run_whisper(job, client, wav, audio_s, job.instance or "vllm", code)
+            return body, None
+        job.detail = f"transcribing and diarizing {audio_s / 60:.0f} min of audio"
+        try:
+            async with asyncio.TaskGroup() as group:
+                whisper = group.create_task(_run_whisper(job, client, wav, audio_s, job.instance or "vllm", code))
+                nemo = group.create_task(
+                    _run_nemo(job, client, wav, audio_s, diarize["instance"], diarize["model"], "offline", evict)
                 )
-            timing["elapsed_s"] = time.monotonic() - started
-        return resp
+        except ExceptionGroup as failed:  # one engine failed; the other was cancelled
+            raise failed.exceptions[0] from None
+        body, timing["transcribe_s"] = whisper.result()
+        timing["diarize_s"] = nemo.result().get("elapsed_s", 0)
+        timing["elapsed_s"] = time.monotonic() - started
+        return body, nemo.result()
 
-    body = await _audio_job(job, audio_url, "vllm", send)
+    body, diarized = await _with_audio(job, audio_url, work)
     # OpenCC only makes sense for Chinese; it would leave other text alone, but skip it.
     traditional = traditional and code == "zh"
     convert = _S2TW.convert if traditional else (lambda text: text)
@@ -991,16 +1029,33 @@ async def _transcribe(job: Job, audio_url: str, language: str, traditional: bool
         {"start": round(seg["start"], 2), "end": round(seg["end"], 2), "text": convert(seg["text"].strip())}
         for seg in body.get("segments") or []
     ]
-    job.result = {
+    result = {
         "model": job.model,
         "language": code,
         "traditional": traditional,
         "audio_s": round(timing["audio_s"], 1),
-        "elapsed_s": round(timing["elapsed_s"], 2),
+        "elapsed_s": round(timing.get("elapsed_s", timing["transcribe_s"]), 2),
         "text": convert(body.get("text", "").strip()),
         "segments": segments,
     }
-    return f"{len(segments)} segments from {timing['audio_s']:.0f} s of audio in {timing['elapsed_s']:.0f} s"
+    summary = f"{len(segments)} segments from {timing['audio_s']:.0f} s of audio in {result['elapsed_s']:.0f} s"
+    if diarized is not None:
+        labelled = align.label(segments, diarized["rttm"])
+        result.update({
+            "diarization_model": diarized["model"],
+            "transcribe_s": round(timing["transcribe_s"], 2),
+            "diarize_s": timing["diarize_s"],
+            "gpu_peak_mib": diarized.get("gpu_peak_mib"),
+            "reserved_burst_mib": diarized.get("reserved_burst_mib"),
+            "segments": labelled,
+            "speakers": align.speakers(diarized["speakers"], labelled),
+            "turns": align.turns(labelled, code),
+            "rttm": diarized["rttm"],
+        })
+        uncertain = sum(s["speaker_uncertain"] for s in labelled)
+        summary += f", {len(diarized['speakers'])} speakers, {uncertain} segments uncertain"
+    job.result = result
+    return summary
 
 
 # ---------------------------------------------------------------- tools
@@ -1248,7 +1303,11 @@ async def model_down(model: str | None = None) -> dict[str, Any]:
         return {"stopped": list(ENGINES), "gpu": _gpu_view()}
 
     names = {model, _ollama_name(model)}
-    jobs = [j for j in JOBS.values() if j.state == "running" and j.kind != "pull" and j.model in names]
+    jobs = [
+        j for j in JOBS.values()
+        if j.state == "running" and j.kind != "pull"
+        and (j.model in names or any(k.split(":", 1)[1] in names for k in j.also))
+    ]
     tasks = _cancel(jobs)
     if tasks:
         await asyncio.wait(tasks, timeout=30)
@@ -1310,31 +1369,51 @@ async def diarize(audio_url: str, mode: Mode = "offline", evict: Evict = "never"
 
 
 @mcp.tool()
-async def transcribe(audio_url: str, language: str = "zh", traditional: bool = True) -> dict[str, Any]:
+async def transcribe(
+    audio_url: str,
+    language: str = "zh",
+    traditional: bool = True,
+    diarize: bool = False,
+    evict: Evict = "never",
+) -> dict[str, Any]:
     """Speech to text with timestamps, with a Whisper model on vllm (model_up engine=vllm
     model=openai/whisper-large-v3 first). audio_url is an http(s) link the server
     downloads; any format ffmpeg reads, up to 2 GB and 2 hours. language is an ISO 639-1
     code; a tag like zh-TW or zh_CN is cut to zh. traditional converts simplified Chinese
     characters to traditional (Taiwan), because Whisper drifts to simplified; it applies
-    only to zh. Several transcriptions run at once. Returns a job; when it is done,
-    job_status carries result with the full text and segments (start, end, text) in
-    seconds."""
+    only to zh. diarize=true also labels speakers: the same audio goes to nemo at the
+    same time (model_up engine=nemo first; neither model is started for you), each
+    segment gets speaker, speaker_confidence and speaker_uncertain, and the result adds
+    speakers, turns (adjacent segments of one speaker merged) and the rttm; evict
+    applies to the diarization's GPU reservation as in diarize. Several transcriptions
+    run at once. Returns a job; when it is done, job_status carries result with the full
+    text and segments (start, end, text) in seconds."""
     _ensure_reconciler()
     await _reconcile()
     inst = _up_instance("vllm", _is_whisper)
+    nemo = _up_instance("nemo", lambda m: True) if diarize else None
+    missing = []
     if inst is None:
-        raise ToolError(
-            "no Whisper model is up: run model_up engine=vllm model=openai/whisper-large-v3 first"
-        )
-    if inst.key in EVICTING:
-        raise ToolError(f"{inst.model} is being stopped to make room for another model")
+        missing.append("model_up engine=vllm model=openai/whisper-large-v3")
+    if diarize and nemo is None:
+        missing.append("model_up engine=nemo model=nvidia/Nemotron-3-Diarization")
+    if missing:
+        what = "Whisper and nemo are" if len(missing) == 2 else "Whisper is" if inst is None else "nemo is"
+        need = " for diarize=true" if diarize else ""
+        raise ToolError(f"{what} not up{need}: run {' and '.join(missing)} first")
+    for up in (inst, nemo):
+        if up is not None and up.key in EVICTING:
+            raise ToolError(f"{up.model} is being stopped to make room for another model")
     if not await _wait_http(f"{INTERNAL['vllm']}/v1/models", 0.1):
         raise ToolError(f"{inst.model} is still starting; wait for its model_up job to finish")
     inst.last_used = time.time()
-    return _start_job(
-        Job("transcribe", "vllm", inst.model, instance=inst.key),
-        lambda j: _transcribe(j, audio_url, language, traditional),
-    )
+    job = Job("transcribe", "vllm", inst.model, instance=inst.key)
+    target = None
+    if nemo is not None:
+        nemo.last_used = time.time()
+        job.also = [nemo.key]
+        target = {"instance": nemo.key, "model": nemo.model}
+    return _start_job(job, lambda j: _transcribe(j, audio_url, language, traditional, target, evict))
 
 
 @mcp.tool()
@@ -1364,6 +1443,9 @@ async def health(_: Request) -> JSONResponse:
 
 
 if __name__ == "__main__":
+    # Audio a previous run was working on when it stopped.
+    for leftover in Path(tempfile.gettempdir()).glob(f"{AUDIO_TMP_PREFIX}*"):
+        shutil.rmtree(leftover, ignore_errors=True)
     mcp.run(
         "streamable-http",
         host="0.0.0.0",

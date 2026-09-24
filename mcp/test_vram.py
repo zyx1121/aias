@@ -101,6 +101,22 @@ QWEN3_8B = {
 }
 
 
+class NemoBurst(unittest.TestCase):
+    def test_short_runs_do_not_set_the_rate(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            store = vram.Store(Path(tmp) / "vram.json")
+            store.record_burst("m", 20, 5)  # 240 MiB/min from fixed overhead
+            self.assertIsNone(store.burst_rate("m"))
+            store.record_burst("m", 3400, 5203)
+            self.assertAlmostEqual(store.burst_rate("m"), 39.21, places=2)
+
+    def test_floor(self):
+        self.assertEqual(vram.nemo_burst_mib(5, 39.2), vram.NEMO_BURST_FLOOR_MIB)
+        self.assertEqual(vram.nemo_burst_mib(5203, 39.2), 3399)
+
+
 class StateFile(unittest.TestCase):
     def load(self, text):
         import tempfile
