@@ -27,12 +27,13 @@ systemctl restart docker
 
 step "Installing the stack to $DEST"
 install -d "$DEST"
-rm -rf "$DEST/mcp" "$DEST/nemo" "$DEST/decoder"
+rm -rf "$DEST/mcp" "$DEST/nemo" "$DEST/audio" "$DEST/decoder"
 cp "$SRC/wsl/compose.yaml" "$DEST/compose.yaml"
 cp -r "$SRC/mcp" "$DEST/mcp"
 cp -r "$SRC/decoder" "$DEST/decoder"
-# Built by the MCP server on the first `model_up engine=nemo`, not here.
+# Built by the MCP server on the first `model_up engine=nemo` or `engine=audio`, not here.
 cp -r "$SRC/nemo" "$DEST/nemo"
+cp -r "$SRC/audio" "$DEST/audio"
 compose=(docker compose -f "$DEST/compose.yaml")
 
 step "Building and starting the MCP server"
