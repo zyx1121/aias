@@ -1,5 +1,5 @@
 """aias MCP server: pull, start and stop local models on one GPU, diarize or
-transcribe audio, and generate sound effects.
+transcribe audio, and generate sound effects and music.
 
 Runs in a container next to the engines and drives them through the Docker
 socket with the same compose file a person would use by hand. Several models
@@ -70,17 +70,42 @@ BUILD_SECS = 3600
 # nemo loads .nemo archives, which can carry pickled code: only NVIDIA's repos.
 # One path segment under nvidia/, so `nvidia/../other/repo` cannot slip through.
 NEMO_REPO = re.compile(r"nvidia/(?!\.+$)[A-Za-z0-9_.-]+")
+
+
+@dataclass(frozen=True)
+class AudioModel:
+    """A model the audio engine runs: what it makes, its longest clip, the repos
+    it loads besides its own, and which of its own files to fetch (None: all)."""
+
+    makes: str
+    max_s: float
+    sample_rate: int
+    channels: int
+    license: str
+    helpers: tuple[str, ...] = ()
+    files: tuple[str, ...] | None = None
+
+
 # AudioCraft loads its weights with torch.load (pickle, which can carry code),
 # so audio takes only these repos, each with the text encoder it loads too.
-AUDIO_REPOS: dict[str, list[str]] = {"facebook/audiogen-medium": ["t5-large"]}
-AUDIO_HELPERS = {h for helpers in AUDIO_REPOS.values() for h in helpers}
+AUDIO_MODELS: dict[str, AudioModel] = {
+    "facebook/audiogen-medium": AudioModel(
+        "sound effects", 30.0, 16000, 1, "CC BY-NC 4.0", helpers=("t5-large",),
+    ),
+    # The AudioCraft checkpoints only; pytorch_model.bin is the transformers copy.
+    "facebook/musicgen-medium": AudioModel(
+        "music", 30.0, 32000, 1, "CC BY-NC 4.0", helpers=("t5-base",),
+        files=("state_dict.bin", "compression_state_dict.bin"),
+    ),
+}
+AUDIO_HELPERS = {h for m in AUDIO_MODELS.values() for h in m.helpers}
 AUDIO_HELPER_FILES = ["config.json", "tokenizer.json", "spiece.model", "model.safetensors"]
 AUDIO_STARTUP_SECS = 600
-# One generate_audio request: a 30 s clip takes about 100 s on an RTX 3080.
-GENERATE_SECS = 600
-AUDIO_MIN_S, AUDIO_MAX_S = 0.5, 30.0
+# One generate_audio request: a 30 s AudioGen clip takes about 100 s on an RTX 3080.
+GENERATE_SECS = 900
+AUDIO_MIN_S = 0.5
 # AudioCraft pins torch 2.1 (CUDA 12.1), which has kernels up to compute
-# capability 9.0: RTX 50 series cards (12.0) cannot run it.
+# capability 9.0: RTX 50 series cards (12.0) cannot run the audio image.
 AUDIO_MAX_COMPUTE_CAP = 9.0
 AUDIO_MAX_PROMPT = 500
 # Generated sound files, served on /files/<name> to the host (and through an SSH
@@ -126,7 +151,8 @@ mcp = MCPServer(
         "Local model host on one NVIDIA GPU. Four engines: ollama (names like qwen3:8b), "
         "vllm (Hugging Face ids like Qwen/Qwen3-0.6B, or openai/whisper-large-v3 for speech "
         "to text), nemo, speaker diarization (nvidia/Nemotron-3-Diarization), and audio, "
-        "sound effects from text (facebook/audiogen-medium). Models share the card within "
+        "audio from text: facebook/audiogen-medium (sound effects) or facebook/musicgen-medium "
+        "(music). Models share the card within "
         "a VRAM budget: any number of ollama models, up to 10 vllm models, one nemo and "
         "one audio model at a time. model_up refuses a model that does not fit and "
         "returns a plan (fits, need_mib, free_mib, evict); pass evict=\"auto\" to stop the "
@@ -316,7 +342,7 @@ def _ollama_models() -> list[dict[str, Any]]:
 
 def _hf_models() -> list[dict[str, Any]]:
     """Hugging Face repos in the shared cache. A repo with a .nemo file is for nemo;
-    the AudioGen repos and their text encoder are for audio."""
+    the audio models' repos and their text encoders are for audio."""
     try:
         cache = scan_cache_dir()
     except Exception:
@@ -328,13 +354,13 @@ def _hf_models() -> list[dict[str, Any]]:
         files = {f.file_name for rev in repo.revisions for f in rev.files}
         if any(name.endswith(".nemo") for name in files):
             engine = "nemo"
-        elif repo.repo_id in AUDIO_REPOS or repo.repo_id in AUDIO_HELPERS:
+        elif repo.repo_id in AUDIO_MODELS or repo.repo_id in AUDIO_HELPERS:
             engine = "audio"
         else:
             engine = "vllm"
         entry = {"engine": engine, "model": repo.repo_id, "size_gb": round(repo.size_on_disk / 1e9, 2)}
         if repo.repo_id in AUDIO_HELPERS:
-            entry["used_by"] = sorted(m for m, helpers in AUDIO_REPOS.items() if repo.repo_id in helpers)
+            entry["used_by"] = sorted(m for m, spec in AUDIO_MODELS.items() if repo.repo_id in spec.helpers)
         models.append(entry)
     return sorted(models, key=lambda m: m["model"])
 
@@ -399,8 +425,8 @@ def _check_nemo_repo(model: str) -> None:
 
 
 def _check_audio_repo(model: str) -> None:
-    if model not in AUDIO_REPOS:
-        raise ToolError(f"audio loads only {', '.join(AUDIO_REPOS)}, not {model}")
+    if model not in AUDIO_MODELS:
+        raise ToolError(f"audio loads only {', '.join(AUDIO_MODELS)}, not {model}")
 
 
 def _check_audio_gpu() -> None:
@@ -543,7 +569,7 @@ async def _simple_need(
     if engine == "nemo":
         return vram.NEMO_BASE_MIB, "estimate", key
     if engine == "audio":
-        return vram.AUDIO_BASE_MIB, "estimate", key
+        return vram.audio_base_mib(model), "estimate", key
     disk = await asyncio.to_thread(_disk_mib, "ollama", model) or 1024
     info = await _ollama_model_info(model, start_server)
     need, _ = vram.ollama_estimate_mib(disk, info)
@@ -1013,17 +1039,22 @@ async def _pull_hf(job: Job) -> str:
 
 
 async def _pull_audio(job: Job) -> str:
-    """The AudioGen repo (two .bin state dicts, 3.7 GB) and the t5-large text
-    encoder it loads at startup (2.8 GB), so the engine starts without a download."""
+    """The model's repo (only the files it loads) and the text encoder it loads at
+    startup, so the engine starts without a download."""
+    spec = AUDIO_MODELS[job.model]
     size = 0
-    repos = [job.model, *AUDIO_REPOS[job.model]]
+    repos = [job.model, *spec.helpers]
     for n, repo in enumerate(repos, 1):
         job.detail = f"downloading {repo} ({n} of {len(repos)})"
-        # Only what transformers loads, not the TensorFlow, Flax and ONNX copies.
-        patterns: dict[str, Any] = {} if repo == job.model else {"allow_patterns": AUDIO_HELPER_FILES}
+        if repo == job.model:
+            patterns: dict[str, Any] = {"allow_patterns": list(spec.files)} if spec.files else {}
+        else:
+            # Only what transformers loads, not the TensorFlow, Flax and ONNX copies.
+            patterns = {"allow_patterns": AUDIO_HELPER_FILES}
         path = await asyncio.to_thread(snapshot_download, repo, **patterns)
         size += sum(p.stat().st_size for p in Path(path).rglob("*") if p.is_file())
-    return f"pulled {job.model} and {', '.join(repos[1:])} ({size / 1e9:.2f} GB)"
+    also = f" and {', '.join(repos[1:])}" if len(repos) > 1 else ""
+    return f"pulled {job.model}{also} ({size / 1e9:.2f} GB)"
 
 
 async def _start_ollama(job: Job, inst: Instance) -> str:
@@ -1346,12 +1377,13 @@ def _save_out(data: bytes) -> tuple[str, float]:
     return name, time.time() + OUT_KEEP_SECS
 
 
-async def _generate(job: Job, prompt: str, duration_s: float, seed: int | None, cfg_coef: float, evict: str) -> str:
+async def _generate(job: Job, prompt: str, duration_s: float, seed: int | None, cfg_coef: float | None,
+                    evict: str) -> str:
     """One clip on the audio engine: queue, reserve its burst, generate, keep the WAV."""
     key = job.instance or "audio"
     job.detail = "waiting for the audio engine"
     async with _queue(key, 1):
-        burst = vram.audio_burst_mib(duration_s, STORE.audio_burst_factor(job.model))
+        burst = vram.audio_burst_mib(job.model, duration_s, STORE.audio_burst_factor(job.model))
         await _reserve_burst(job, burst, evict, {key})
         job.detail = f"generating {duration_s:g} s of audio"
         try:
@@ -1374,6 +1406,7 @@ async def _generate(job: Job, prompt: str, duration_s: float, seed: int | None, 
         stats = {}
     if stats.get("burst_mib") and stats.get("audio_s"):
         STORE.record_audio_burst(job.model, stats["burst_mib"], stats["audio_s"])
+    spec = AUDIO_MODELS.get(job.model)
     name, expires = await asyncio.to_thread(_save_out, resp.content)
     job.result = {
         "url": f"http://127.0.0.1:{PORT}/files/{name}",
@@ -1383,6 +1416,7 @@ async def _generate(job: Job, prompt: str, duration_s: float, seed: int | None, 
         "prompt": prompt,
         **stats,
         "reserved_burst_mib": burst,
+        "license": spec.license if spec else None,
     }
     return f"{stats.get('audio_s', duration_s):g} s of audio in {stats.get('elapsed_s', 0):.0f} s: {job.result['url']}"
 
@@ -1434,7 +1468,9 @@ async def status() -> dict[str, Any]:
                 # nemo runs one file at a time; a new one waits, then gets this.
                 entry["max_audio_minutes_next"] = _diarize_capacity(inst.model, freed_mib=in_flight)
         if inst.engine == "audio":
-            entry["max_duration_s"] = AUDIO_MAX_S
+            if spec := AUDIO_MODELS.get(inst.model):
+                entry.update(makes=spec.makes, max_duration_s=spec.max_s, sample_rate=spec.sample_rate,
+                             channels=spec.channels, license=spec.license)
         up.append(entry)
     if "ollama" in running and not any(i.engine == "ollama" for i in INSTANCES.values()):
         # The server is up with nothing loaded; keep the old one-entry shape.
@@ -1495,8 +1531,8 @@ async def model_list(engine: Engine | None = None) -> list[dict[str, Any]]:
 async def model_pull(engine: Engine, model: str) -> dict[str, Any]:
     """Download a model. ollama takes library names like qwen3:8b; vllm, nemo and audio take
     Hugging Face repo ids like Qwen/Qwen3-0.6B, nvidia/Nemotron-3-Diarization or
-    facebook/audiogen-medium (which also fetches its t5-large text encoder). Returns a
-    job; poll job_status."""
+    facebook/audiogen-medium (with its t5-large text encoder) or facebook/musicgen-medium
+    (with t5-base). Returns a job; poll job_status."""
     _ensure_reconciler()
     _check_repo(engine, model)
     work = _pull_ollama if engine == "ollama" else _pull_hf
@@ -1788,35 +1824,38 @@ async def generate_audio(
     prompt: str,
     duration_s: float = 5.0,
     seed: StrictInt | None = None,
-    cfg_coef: float = 3.0,
+    cfg_coef: float | None = None,
     evict: Evict = "never",
 ) -> dict[str, Any]:
-    """Generate a sound effect from an English text prompt with the audio engine
-    (model_up engine=audio model=facebook/audiogen-medium first), e.g. "dog barking in
-    the distance, light rain". duration_s is 0.5 to 30; AudioGen is trained on 10 s
-    clips and extends longer ones, which takes longer and drifts more. seed makes a run
-    repeatable (the result gives the one used); cfg_coef (0 to 10, default 3) is how
-    closely it follows the prompt. A run needs some GPU memory on top of the model; if
-    that does not fit, the job fails with a plan, and evict="auto" lets it stop least
-    recently used models. One clip at a time; later ones wait. Returns a job; when it is
-    done, result.url is a 16 kHz mono WAV to download (kept 24 hours), with seed,
-    audio_s and elapsed_s. Output is licensed CC BY-NC 4.0 (the model's license)."""
+    """Generate audio from an English text prompt with the audio model that is up
+    (model_up engine=audio first): facebook/audiogen-medium makes sound effects ("dog
+    barking in the distance, light rain"), facebook/musicgen-medium makes music ("upbeat
+    lo-fi hip hop beat with piano"). duration_s is 0.5 up to the model's max_duration_s
+    (status), 30 for both; AudioGen extends clips past 10 s, which takes longer and
+    drifts more. seed makes a run repeatable (the result gives the one used); cfg_coef
+    (0 to 10, default 3) is how closely it follows the prompt. A run
+    needs some GPU memory on top of the model; if that does not fit, the job fails with
+    a plan, and evict="auto" lets it stop least recently used models. One clip at a
+    time; later ones wait. Returns a job; when it is done, result.url is a WAV to
+    download (kept 24 hours), with seed, audio_s, sample_rate, elapsed_s and the
+    license of what was made."""
     _ensure_reconciler()
     await _reconcile()
     prompt = prompt.strip()
     if not prompt or len(prompt) > AUDIO_MAX_PROMPT:
         raise ToolError(f"prompt must be 1 to {AUDIO_MAX_PROMPT} characters")
-    if not AUDIO_MIN_S <= duration_s <= AUDIO_MAX_S:
-        raise ToolError(f"duration_s must be from {AUDIO_MIN_S:g} to {AUDIO_MAX_S:g}, not {duration_s:g}")
-    if not 0 <= cfg_coef <= 10:
+    if cfg_coef is not None and not 0 <= cfg_coef <= 10:
         raise ToolError(f"cfg_coef must be from 0 to 10, not {cfg_coef:g}")
     if seed is not None and not 0 <= seed < 2**31:
         raise ToolError("seed must be from 0 to 2147483647")
     inst = _up_instance("audio", lambda m: True)
     if inst is None:
-        raise ToolError(f"audio is not up: run model_up engine=audio model={next(iter(AUDIO_REPOS))} first")
+        raise ToolError(f"audio is not up: run model_up engine=audio model=<one of {', '.join(AUDIO_MODELS)}> first")
     if inst.key in EVICTING:
         raise ToolError(f"{inst.model} is being stopped to make room for another model")
+    spec = AUDIO_MODELS[inst.model]
+    if not AUDIO_MIN_S <= duration_s <= spec.max_s:
+        raise ToolError(f"duration_s must be from {AUDIO_MIN_S:g} to {spec.max_s:g} for {inst.model}, not {duration_s:g}")
     job = Job("generate", "audio", inst.model, instance=inst.key)
     inst.last_used = time.time()
     return _start_job(job, lambda j: _generate(j, prompt, duration_s, seed, cfg_coef, evict))

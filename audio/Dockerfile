@@ -6,8 +6,9 @@ RUN apt-get update \
 RUN pip install --no-cache-dir uv==0.12.18
 # AudioCraft 1.3.0 pins torch 2.1.0 and pulls in training and demo packages
 # (gradio, demucs, torchtext, ...). Install it without dependencies and add
-# only what AudioGen inference imports, pinned: the image is built on the
-# user's machine at the first model_up, so a new upstream release must not break it.
+# only what AudioGen and MusicGen inference import, pinned: the image is built
+# on the user's machine at the first model_up, so a new upstream release must
+# not break it.
 # av 12 instead of AudioCraft's pinned 11.0.0: 11.0.0 has no wheel here and
 # builds from source; AudioGen only uses av.open to read audio. torchmetrics
 # because audiocraft.models imports the solvers, which import the metrics.
