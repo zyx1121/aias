@@ -35,6 +35,8 @@ services:
       - aias-state:/state
       # Downloaded audio and its decoded WAV, shared with the decoder.
       - audio-work:/work
+      # Sound files generate_audio made, served on /files until they expire.
+      - audio-out:/out
 
   ollama:
     image: ollama/ollama:0.32.15
@@ -107,8 +109,21 @@ services:
       - hf-cache:/root/.cache/huggingface
       - nemo-cache:/cache
 
+  # Sound effects from text (AudioGen). Built on first use, not at install.
+  # No published port: the MCP server calls it on the compose network.
+  audio:
+    build: ./audio
+    image: aias-audio:local
+    profiles: [engine]
+    gpus: all
+    environment:
+      AUDIO_MODEL: ${AUDIO_MODEL:-facebook/audiogen-medium}
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+
 volumes:
   aias-state:
+  audio-out:
   audio-work:
   hf-cache:
   vllm-cache:

@@ -1,10 +1,11 @@
-"""aias MCP server: pull, start and stop local models on one GPU, and diarize or
-transcribe audio.
+"""aias MCP server: pull, start and stop local models on one GPU, diarize or
+transcribe audio, and generate sound effects.
 
 Runs in a container next to the engines and drives them through the Docker
 socket with the same compose file a person would use by hand. Several models
 share the card: one Ollama server (any number of models), up to 10 vLLM models
-(one container and port each) and one nemo model, admitted against a VRAM budget (vram.py).
+(one container and port each), one nemo model and one audio model, admitted
+against a VRAM budget (vram.py).
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
@@ -34,14 +36,16 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import StrictInt
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import FileResponse, JSONResponse, Response
 
 import align
 import vram
 from audio import MAX_AUDIO_SECS, WORK, AudioError, fetch_wav
 
-Engine = Literal["ollama", "vllm", "nemo"]
-ENGINES: tuple[Engine, ...] = ("ollama", "vllm", "nemo")
+Engine = Literal["ollama", "vllm", "nemo", "audio"]
+ENGINES: tuple[Engine, ...] = ("ollama", "vllm", "nemo", "audio")
+# Engines that run one model in their compose service's single container.
+SINGLE: tuple[Engine, ...] = ("nemo", "audio")
 Mode = Literal["offline", "low", "verylow", "ultralow"]
 Evict = Literal["never", "auto"]
 
@@ -49,8 +53,9 @@ COMPOSE = ["docker", "compose", "-f", os.environ.get("AIAS_COMPOSE", "/opt/aias/
 PORT = 11400
 # Inside the compose network the engines answer on their service names; each
 # vLLM model is its own container, named by its port (VLLM_PORTS).
-INTERNAL = {"ollama": "http://ollama:11434", "nemo": "http://nemo:8100"}
-# What a client on the Windows host uses. nemo has no port; diarize reaches it.
+INTERNAL = {"ollama": "http://ollama:11434", "nemo": "http://nemo:8100", "audio": "http://audio:8200"}
+# What a client on the Windows host uses. nemo and audio have no port; diarize
+# and generate_audio reach them.
 PUBLIC = {"ollama": "http://127.0.0.1:11434/v1"}
 # One port per vLLM model, lowest free first, so a lone model is on 8000 as before.
 VLLM_PORTS = range(8000, 8010)
@@ -60,10 +65,31 @@ LABEL = "aias"
 OLLAMA_MANIFESTS = Path("/ollama/models/manifests")
 VLLM_STARTUP_SECS = 900
 NEMO_STARTUP_SECS = 600
-NEMO_BUILD_SECS = 3600
+# Image builds of the single-model engines (nemo, audio), on their first start.
+BUILD_SECS = 3600
 # nemo loads .nemo archives, which can carry pickled code: only NVIDIA's repos.
 # One path segment under nvidia/, so `nvidia/../other/repo` cannot slip through.
 NEMO_REPO = re.compile(r"nvidia/(?!\.+$)[A-Za-z0-9_.-]+")
+# AudioCraft loads its weights with torch.load (pickle, which can carry code),
+# so audio takes only these repos, each with the text encoder it loads too.
+AUDIO_REPOS: dict[str, list[str]] = {"facebook/audiogen-medium": ["t5-large"]}
+AUDIO_HELPERS = {h for helpers in AUDIO_REPOS.values() for h in helpers}
+AUDIO_HELPER_FILES = ["config.json", "tokenizer.json", "spiece.model", "model.safetensors"]
+AUDIO_STARTUP_SECS = 600
+# One generate_audio request: a 30 s clip takes about 100 s on an RTX 3080.
+GENERATE_SECS = 600
+AUDIO_MIN_S, AUDIO_MAX_S = 0.5, 30.0
+# AudioCraft pins torch 2.1 (CUDA 12.1), which has kernels up to compute
+# capability 9.0: RTX 50 series cards (12.0) cannot run it.
+AUDIO_MAX_COMPUTE_CAP = 9.0
+AUDIO_MAX_PROMPT = 500
+# Generated sound files, served on /files/<name> to the host (and through an SSH
+# tunnel to the agent's machine). Kept a day and at most 1 GB, oldest out first.
+OUT = Path(os.environ.get("AIAS_OUT", "/out"))
+OUT_KEEP_SECS = 24 * 3600
+OUT_MAX_BYTES = 1 << 30
+OUT_NAME = re.compile(r"[0-9a-f]{32}\.wav")
+LOCAL_HOSTS = [f"localhost:{PORT}", f"127.0.0.1:{PORT}"]
 # One diarize or transcribe call end to end: audio.py caps the download at
 # 10 minutes and the audio at 2 hours, which ultralow diarization needs about
 # 25 minutes for.
@@ -97,18 +123,21 @@ log = logging.getLogger("aias")
 mcp = MCPServer(
     "aias",
     instructions=(
-        "Local model host on one NVIDIA GPU. Three engines: ollama (names like qwen3:8b), "
+        "Local model host on one NVIDIA GPU. Four engines: ollama (names like qwen3:8b), "
         "vllm (Hugging Face ids like Qwen/Qwen3-0.6B, or openai/whisper-large-v3 for speech "
-        "to text) and nemo, speaker diarization (nvidia/Nemotron-3-Diarization). Models "
-        "share the card within a VRAM budget: any number of ollama models, up to 10 vllm models "
-        "and one nemo model at a time. model_up refuses a model that does not fit and "
+        "to text), nemo, speaker diarization (nvidia/Nemotron-3-Diarization), and audio, "
+        "sound effects from text (facebook/audiogen-medium). Models share the card within "
+        "a VRAM budget: any number of ollama models, up to 10 vllm models, one nemo and "
+        "one audio model at a time. model_up refuses a model that does not fit and "
         "returns a plan (fits, need_mib, free_mib, evict); pass evict=\"auto\" to stop the "
         "least recently used models in that plan, dry_run=true to only see it, and "
-        "pin=true to keep a model from being evicted. Pulls, startups, diarize and "
-        "transcribe runs are jobs: poll job_status until each finishes. Once an ollama or "
+        "pin=true to keep a model from being evicted. Pulls, startups, diarize, "
+        "transcribe and generate_audio runs are jobs: poll job_status until each finishes. Once an ollama or "
         "vllm model is up, call it through the OpenAI compatible base_url that status "
         "returns. Once nemo is up, call diarize with an audio URL; once a whisper model is "
-        "up on vllm, call transcribe. The finished job carries the output in result. "
+        "up on vllm, call transcribe; once audio is up, call generate_audio with a prompt "
+        "and download the WAV from the url in its result. The finished job carries the "
+        "output in result. "
         "model_down with a model stops only that one; without one it stops everything."
     ),
 )
@@ -122,11 +151,11 @@ _NO_LOCK = contextlib.nullcontext()
 # job's `up` keeps running in its worker thread, so a later `stop` must wait for it.
 # Reentrant, so a check-then-stop can hold it across both steps.
 _COMPOSE_LOCK = threading.RLock()
-# The nemo image build in progress, so model_down can end it instead of
-# waiting minutes for the lock.
-_BUILD: subprocess.Popen[str] | None = None
+# The nemo or audio image build in progress, per service, so model_down can end
+# it instead of waiting minutes for the lock, without touching the other one's.
+_BUILDS: dict[str, subprocess.Popen[str]] = {}
 # Set by model_down so a build still waiting for the lock never starts.
-_BUILD_CANCELLED = threading.Event()
+_BUILD_CANCELLED: dict[str, threading.Event] = {engine: threading.Event() for engine in SINGLE}
 
 
 def _run(*args: str, env: dict[str, str] | None = None, timeout: float = 600) -> str:
@@ -202,39 +231,47 @@ def _remove_vllm(names: list[str]) -> None:
             subprocess.run(["docker", "rm", "-f", *names], capture_output=True, text=True, timeout=120)
 
 
-def _nemo_model_from_container() -> str | None:
-    for var in _inspect("aias-nemo-1", "{{json .Config.Env}}"):
-        if var.startswith("NEMO_MODEL="):
+def _model_env(engine: str) -> str:
+    """The variable that names the model of a single-model engine (NEMO_MODEL)."""
+    return f"{engine.upper()}_MODEL"
+
+
+def _single_model(engine: str) -> str | None:
+    """The model the nemo or audio container was started with."""
+    for var in _inspect(f"aias-{engine}-1", "{{json .Config.Env}}"):
+        if var.startswith(f"{_model_env(engine)}="):
             return var.split("=", 1)[1]
     return None
 
 
-def _build_nemo() -> None:
-    """Build the nemo image. Runs on every model_up: an unchanged nemo/ is a cache
-    hit in seconds, and a changed one (after an upgrade) gets rebuilt."""
-    global _BUILD
+def _build(service: str) -> None:
+    """Build the nemo or audio image. Runs on every model_up: an unchanged
+    directory is a cache hit in seconds, and a changed one (after an upgrade)
+    gets rebuilt."""
     with _COMPOSE_LOCK:
-        if _BUILD_CANCELLED.is_set():
-            raise RuntimeError("nemo image build cancelled by model_down")
+        if _BUILD_CANCELLED[service].is_set():
+            raise RuntimeError(f"{service} image build cancelled by model_down")
         proc = subprocess.Popen(
-            [*COMPOSE, "build", "nemo"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+            [*COMPOSE, "build", service], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
         )
-        _BUILD = proc
+        _BUILDS[service] = proc
         try:
-            out, _ = proc.communicate(timeout=NEMO_BUILD_SECS)
+            out, _ = proc.communicate(timeout=BUILD_SECS)
         except subprocess.TimeoutExpired:
             proc.kill()
             out, _ = proc.communicate()
         finally:
-            _BUILD = None
+            _BUILDS.pop(service, None)
     if proc.returncode != 0:
-        raise RuntimeError(f"building the nemo image failed (exit {proc.returncode}): {out.strip()[-2000:]}")
+        raise RuntimeError(f"building the {service} image failed (exit {proc.returncode}): {out.strip()[-2000:]}")
 
 
-def _cancel_build() -> None:
-    _BUILD_CANCELLED.set()
-    if (proc := _BUILD) is not None and proc.poll() is None:
-        proc.terminate()
+def _cancel_build(service: str | None = None) -> None:
+    """End the build of service, or of every single-model engine."""
+    for name in (service,) if service else SINGLE:
+        _BUILD_CANCELLED[name].set()
+        if (proc := _BUILDS.get(name)) is not None and proc.poll() is None:
+            proc.terminate()
 
 
 def _stop(*services: str) -> None:
@@ -278,7 +315,8 @@ def _ollama_models() -> list[dict[str, Any]]:
 
 
 def _hf_models() -> list[dict[str, Any]]:
-    """Hugging Face repos in the shared cache. A repo with a .nemo file is for nemo."""
+    """Hugging Face repos in the shared cache. A repo with a .nemo file is for nemo;
+    the AudioGen repos and their text encoder are for audio."""
     try:
         cache = scan_cache_dir()
     except Exception:
@@ -288,8 +326,16 @@ def _hf_models() -> list[dict[str, Any]]:
         if repo.repo_type != "model":
             continue
         files = {f.file_name for rev in repo.revisions for f in rev.files}
-        engine = "nemo" if any(name.endswith(".nemo") for name in files) else "vllm"
-        models.append({"engine": engine, "model": repo.repo_id, "size_gb": round(repo.size_on_disk / 1e9, 2)})
+        if any(name.endswith(".nemo") for name in files):
+            engine = "nemo"
+        elif repo.repo_id in AUDIO_REPOS or repo.repo_id in AUDIO_HELPERS:
+            engine = "audio"
+        else:
+            engine = "vllm"
+        entry = {"engine": engine, "model": repo.repo_id, "size_gb": round(repo.size_on_disk / 1e9, 2)}
+        if repo.repo_id in AUDIO_HELPERS:
+            entry["used_by"] = sorted(m for m, helpers in AUDIO_REPOS.items() if repo.repo_id in helpers)
+        models.append(entry)
     return sorted(models, key=lambda m: m["model"])
 
 
@@ -352,6 +398,27 @@ def _check_nemo_repo(model: str) -> None:
         raise ToolError(f"nemo only loads Hugging Face repos named nvidia/<name>, not {model}")
 
 
+def _check_audio_repo(model: str) -> None:
+    if model not in AUDIO_REPOS:
+        raise ToolError(f"audio loads only {', '.join(AUDIO_REPOS)}, not {model}")
+
+
+def _check_audio_gpu() -> None:
+    cap = vram.compute_cap()
+    if cap is not None and cap > AUDIO_MAX_COMPUTE_CAP:
+        raise ToolError(
+            f"the audio engine runs on torch 2.1, which has no kernels for this GPU (compute capability "
+            f"{cap:g}, above {AUDIO_MAX_COMPUTE_CAP:g}); RTX 50 series cards are not supported yet"
+        )
+
+
+def _check_repo(engine: str, model: str) -> None:
+    if engine == "nemo":
+        _check_nemo_repo(model)
+    elif engine == "audio":
+        _check_audio_repo(model)
+
+
 # ---------------------------------------------------------------- ledger
 
 
@@ -390,7 +457,8 @@ class Instance:
 
 
 INSTANCES: dict[str, Instance] = {}
-# Extra memory a running job holds on top of its instance (nemo's per-file peak).
+# Extra memory a running job holds on top of its instance (nemo's per-file peak,
+# audio's per-clip peak).
 BURSTS: dict[str, int] = {}
 STORE = vram.Store()
 # Held while models start, get evicted or bursts get reserved, so two
@@ -466,7 +534,7 @@ async def _ollama_model_info(model: str, start_server: bool) -> dict[str, Any] |
 async def _simple_need(
     engine: str, model: str, vram_mib: int | None, start_server: bool = True
 ) -> tuple[int, str, str]:
-    """(need, source, record key) for ollama and nemo."""
+    """(need, source, record key) for ollama, nemo and audio."""
     key = f"{engine}:{model}"
     if vram_mib:
         return vram_mib, "declared", key
@@ -474,6 +542,8 @@ async def _simple_need(
         return measured, "measured", key
     if engine == "nemo":
         return vram.NEMO_BASE_MIB, "estimate", key
+    if engine == "audio":
+        return vram.AUDIO_BASE_MIB, "estimate", key
     disk = await asyncio.to_thread(_disk_mib, "ollama", model) or 1024
     info = await _ollama_model_info(model, start_server)
     need, _ = vram.ollama_estimate_mib(disk, info)
@@ -519,8 +589,8 @@ async def _sync_vllm() -> None:
 
 
 async def _sync_single(engine: Engine, running: dict[str, Any]) -> None:
-    """Match the ledger to the nemo container, which may have been started,
-    stopped or have crashed without aias (or before an MCP restart)."""
+    """Match the ledger to the nemo or audio container, which may have been
+    started, stopped or have crashed without aias (or before an MCP restart)."""
     inst = next((i for i in INSTANCES.values() if i.engine == engine), None)
     if engine not in running:
         if inst is not None and inst.settled():
@@ -528,10 +598,10 @@ async def _sync_single(engine: Engine, running: dict[str, Any]) -> None:
         return
     if inst is not None and inst.starting:
         return
-    model = await asyncio.to_thread(_nemo_model_from_container)
+    model = await asyncio.to_thread(_single_model, engine)
     if not model:
         return
-    need, source, key = await _simple_need("nemo", model, None)
+    need, source, key = await _simple_need(engine, model, None)
     if inst is not None:
         if inst.model == model:
             if inst.vram_source == "estimate" and (inst.vram_mib, inst.record_key) != (need, key):
@@ -599,7 +669,8 @@ async def _reconcile_once() -> None:
         log.warning("stopping %s, the old single vLLM container", LEGACY_VLLM)
         await asyncio.to_thread(_stop, "vllm")
     await _sync_vllm()
-    await _sync_single("nemo", running)
+    for engine in SINGLE:
+        await _sync_single(engine, running)
     await _sync_ollama(running)
     if card:
         # What nvidia-smi shows beyond the ledger is the desktop and anything
@@ -801,9 +872,9 @@ def _start_job(job: Job, work: Any) -> dict[str, Any]:
 
 
 def _replacements(engine: Engine, key: str) -> list[str]:
-    """nemo holds one model: the other one, if any, has to go. Refused if it is
-    pinned, starting or running a job. vLLM models sit side by side."""
-    if engine != "nemo":
+    """nemo and audio hold one model each: the other one, if any, has to go.
+    Refused if it is pinned, starting or running a job. vLLM models sit side by side."""
+    if engine not in SINGLE:
         return []
     others = [i for i in INSTANCES.values() if i.engine == engine and i.key != key]
     for other in others:
@@ -922,6 +993,8 @@ async def _pull_ollama(job: Job) -> str:
 
 
 async def _pull_hf(job: Job) -> str:
+    if job.engine == "audio":
+        return await _pull_audio(job)
     files = await asyncio.to_thread(HfApi().list_repo_files, job.model)
     if job.engine == "nemo":
         # NeMo loads the single .nemo archive; skip the safetensors, gguf and demo video.
@@ -937,6 +1010,20 @@ async def _pull_hf(job: Job) -> str:
     path = await asyncio.to_thread(snapshot_download, job.model, **patterns)
     size = sum(p.stat().st_size for p in Path(path).rglob("*") if p.is_file())
     return f"pulled {job.model} ({size / 1e9:.2f} GB)"
+
+
+async def _pull_audio(job: Job) -> str:
+    """The AudioGen repo (two .bin state dicts, 3.7 GB) and the t5-large text
+    encoder it loads at startup (2.8 GB), so the engine starts without a download."""
+    size = 0
+    repos = [job.model, *AUDIO_REPOS[job.model]]
+    for n, repo in enumerate(repos, 1):
+        job.detail = f"downloading {repo} ({n} of {len(repos)})"
+        # Only what transformers loads, not the TensorFlow, Flax and ONNX copies.
+        patterns: dict[str, Any] = {} if repo == job.model else {"allow_patterns": AUDIO_HELPER_FILES}
+        path = await asyncio.to_thread(snapshot_download, repo, **patterns)
+        size += sum(p.stat().st_size for p in Path(path).rglob("*") if p.is_file())
+    return f"pulled {job.model} and {', '.join(repos[1:])} ({size / 1e9:.2f} GB)"
 
 
 async def _start_ollama(job: Job, inst: Instance) -> str:
@@ -1023,22 +1110,26 @@ def _start_vllm(cfg: dict[str, Any]) -> Any:
     return start
 
 
-async def _start_nemo(job: Job, inst: Instance) -> str:
-    job.detail = "building the nemo image (about 5 minutes the first time, seconds after)"
-    _BUILD_CANCELLED.clear()
-    await asyncio.to_thread(_build_nemo)
-    await asyncio.to_thread(_run, "up", "-d", "--force-recreate", "nemo", env={"NEMO_MODEL": inst.model})
+async def _start_single(job: Job, inst: Instance) -> str:
+    """Start nemo or audio: build its image (a cache hit after the first time), then
+    recreate its one container with the model and wait for it to load."""
+    engine = inst.engine
+    job.detail = f"building the {engine} image (about 5 minutes the first time, seconds after)"
+    _BUILD_CANCELLED[engine].clear()
+    await asyncio.to_thread(_build, engine)
+    await asyncio.to_thread(_run, "up", "-d", "--force-recreate", engine, env={_model_env(engine): inst.model})
     job.detail = "loading the model onto the GPU"
 
     def alive() -> bool:
-        return "nemo" in _running()
+        return engine in _running()
 
-    if await _wait_http(f"{INTERNAL['nemo']}/health", NEMO_STARTUP_SECS, alive):
-        return f"{inst.model} is up; call diarize"
-    tail = await asyncio.to_thread(_run, "logs", "--no-log-prefix", "--tail", "40", "nemo")
+    secs = NEMO_STARTUP_SECS if engine == "nemo" else AUDIO_STARTUP_SECS
+    if await _wait_http(f"{INTERNAL[engine]}/health", secs, alive):
+        return f"{inst.model} is up; call {'diarize' if engine == 'nemo' else 'generate_audio'}"
+    tail = await asyncio.to_thread(_run, "logs", "--no-log-prefix", "--tail", "40", engine)
     with contextlib.suppress(RuntimeError):
-        await asyncio.to_thread(_stop, "nemo")
-    raise RuntimeError(f"nemo did not become ready. Last log lines:\n{tail}")
+        await asyncio.to_thread(_stop, engine)
+    raise RuntimeError(f"{engine} did not become ready. Last log lines:\n{tail}")
 
 
 async def _with_audio(job: Job, audio_url: str, work: Any) -> Any:
@@ -1223,6 +1314,79 @@ async def _transcribe(
     return summary
 
 
+def _prune_out() -> None:
+    """Drop generated files past OUT_KEEP_SECS, then the oldest past OUT_MAX_BYTES.
+    A .tmp left by a crash mid-write goes with the expired ones."""
+    now = time.time()
+    files = []
+    for f in [*OUT.glob("*.wav"), *OUT.glob(".*.tmp")]:
+        with contextlib.suppress(OSError):
+            st = f.stat()
+            if now - st.st_mtime > OUT_KEEP_SECS:
+                f.unlink()
+            elif f.suffix == ".wav":
+                files.append((st.st_mtime, st.st_size, f))
+    total = sum(size for _, size, _ in files)
+    for _, size, f in sorted(files):
+        if total <= OUT_MAX_BYTES:
+            break
+        with contextlib.suppress(OSError):
+            f.unlink()
+        total -= size
+
+
+def _save_out(data: bytes) -> tuple[str, float]:
+    """Write a generated WAV under a random name; returns the name and when it expires."""
+    OUT.mkdir(parents=True, exist_ok=True)
+    _prune_out()
+    name = f"{uuid.uuid4().hex}.wav"
+    tmp = OUT / f".{name}.tmp"
+    tmp.write_bytes(data)
+    os.replace(tmp, OUT / name)
+    return name, time.time() + OUT_KEEP_SECS
+
+
+async def _generate(job: Job, prompt: str, duration_s: float, seed: int | None, cfg_coef: float, evict: str) -> str:
+    """One clip on the audio engine: queue, reserve its burst, generate, keep the WAV."""
+    key = job.instance or "audio"
+    job.detail = "waiting for the audio engine"
+    async with _queue(key, 1):
+        burst = vram.audio_burst_mib(duration_s, STORE.audio_burst_factor(job.model))
+        await _reserve_burst(job, burst, evict, {key})
+        job.detail = f"generating {duration_s:g} s of audio"
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(GENERATE_SECS, connect=10)) as client:
+                resp = await client.post(
+                    f"{INTERNAL['audio']}/generate",
+                    json={"prompt": prompt, "duration_s": duration_s, "seed": seed, "cfg_coef": cfg_coef},
+                )
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"could not reach the audio engine: {type(exc).__name__} {exc}".rstrip()) from exc
+        finally:
+            if BURSTS.pop(job.id, None) is not None:
+                _touch()
+    if resp.status_code != 200 or not resp.content.startswith(b"RIFF"):
+        _reply(resp, "audio")
+        raise RuntimeError("the audio engine did not answer with a WAV file")
+    try:
+        stats = json.loads(resp.headers.get("x-aias-result") or "{}")
+    except ValueError:
+        stats = {}
+    if stats.get("burst_mib") and stats.get("audio_s"):
+        STORE.record_audio_burst(job.model, stats["burst_mib"], stats["audio_s"])
+    name, expires = await asyncio.to_thread(_save_out, resp.content)
+    job.result = {
+        "url": f"http://127.0.0.1:{PORT}/files/{name}",
+        "file": name,
+        "bytes": len(resp.content),
+        "expires": _iso(expires),
+        "prompt": prompt,
+        **stats,
+        "reserved_burst_mib": burst,
+    }
+    return f"{stats.get('audio_s', duration_s):g} s of audio in {stats.get('elapsed_s', 0):.0f} s: {job.result['url']}"
+
+
 # ---------------------------------------------------------------- tools
 
 
@@ -1243,8 +1407,8 @@ async def status() -> dict[str, Any]:
     for inst in sorted(INSTANCES.values(), key=lambda i: i.key):
         if inst.engine == "vllm":
             ready = not inst.starting and bool(inst.port) and await _wait_http(f"{inst.url}/v1/models", 0.1)
-        elif inst.engine == "nemo":
-            ready = not inst.starting and await _wait_http(f"{INTERNAL['nemo']}/health", 0.1)
+        elif inst.engine in SINGLE:
+            ready = not inst.starting and await _wait_http(f"{INTERNAL[inst.engine]}/health", 0.1)
         else:
             ready = not inst.starting
         entry = {
@@ -1269,6 +1433,8 @@ async def status() -> dict[str, Any]:
             if in_flight:
                 # nemo runs one file at a time; a new one waits, then gets this.
                 entry["max_audio_minutes_next"] = _diarize_capacity(inst.model, freed_mib=in_flight)
+        if inst.engine == "audio":
+            entry["max_duration_s"] = AUDIO_MAX_S
         up.append(entry)
     if "ollama" in running and not any(i.engine == "ollama" for i in INSTANCES.values()):
         # The server is up with nothing loaded; keep the old one-entry shape.
@@ -1312,6 +1478,8 @@ async def model_list(engine: Engine | None = None) -> list[dict[str, Any]]:
         m["loaded"] = inst is not None
         if inst is not None:
             m["vram_mib"], m["vram_source"] = inst.vram_mib, inst.vram_source
+        elif "used_by" in m:  # a text encoder, counted in the model that loads it
+            m["vram_mib"], m["vram_source"] = None, "part_of_model"
         elif m["engine"] == "vllm":
             try:
                 cfg = await asyncio.to_thread(_vllm_config, m["model"], None, None, None)
@@ -1325,12 +1493,12 @@ async def model_list(engine: Engine | None = None) -> list[dict[str, Any]]:
 
 @mcp.tool()
 async def model_pull(engine: Engine, model: str) -> dict[str, Any]:
-    """Download a model. ollama takes library names like qwen3:8b; vllm and nemo take Hugging
-    Face repo ids like Qwen/Qwen3-0.6B or nvidia/Nemotron-3-Diarization. Returns a job;
-    poll job_status."""
+    """Download a model. ollama takes library names like qwen3:8b; vllm, nemo and audio take
+    Hugging Face repo ids like Qwen/Qwen3-0.6B, nvidia/Nemotron-3-Diarization or
+    facebook/audiogen-medium (which also fetches its t5-large text encoder). Returns a
+    job; poll job_status."""
     _ensure_reconciler()
-    if engine == "nemo":
-        _check_nemo_repo(model)
+    _check_repo(engine, model)
     work = _pull_ollama if engine == "ollama" else _pull_hf
     return _start_job(Job("pull", engine, model), work)
 
@@ -1356,16 +1524,18 @@ async def model_up(
     the need and wins over aias's own measurement, to correct a wrong one. pin=true
     keeps it from being evicted (false unpins).
     Each vllm model gets its own container and port (8000 first, up to 8009; status
-    gives each its base_url); nemo holds one model, so asking for another replaces
-    it. max_model_len and
+    gives each its base_url); nemo and audio hold one model each, so asking for
+    another replaces it. max_model_len and
     gpu_memory_utilization apply to vllm only; left out, they are 8192 and 0.8, or 448
     and 0.4 for a Whisper model. vLLM startup takes 40 s to several minutes; the first
-    nemo start builds its image and takes about 5 minutes. Returns a job; when it is
-    done, status shows the base_url (nemo has none: use diarize)."""
+    nemo or audio start builds its image and takes about 5 minutes. Returns a job; when
+    it is done, status shows the base_url (nemo and audio have none: use diarize or
+    generate_audio)."""
     _ensure_reconciler()
     await _reconcile()
-    if engine == "nemo":
-        _check_nemo_repo(model)
+    _check_repo(engine, model)
+    if engine == "audio":
+        await asyncio.to_thread(_check_audio_gpu)
     if engine == "ollama":
         model = _ollama_name(model)
     total = _total()
@@ -1406,7 +1576,7 @@ async def model_up(
         return {"model": model, "engine": engine, "vram_source": source, **_refusal(plan)}
 
     inst = Instance(engine, model, need, source, record_key)
-    start = _start_ollama if engine == "ollama" else _start_nemo if engine == "nemo" else _start_vllm(cfg)
+    start = _start_ollama if engine == "ollama" else _start_single if engine in SINGLE else _start_vllm(cfg)
 
     async def work(job: Job) -> str:
         detail = await _place(job, inst, evict, start)
@@ -1421,9 +1591,9 @@ def _cancel(jobs: list[Job]) -> list[asyncio.Task]:
     tasks = []
     for job in jobs:
         if job.task is not None and not job.task.done():
-            if job.kind == "up" and job.engine == "nemo":
+            if job.kind == "up" and job.engine in SINGLE:
                 # A build holds the compose lock for minutes; end it so _stop gets the lock.
-                _cancel_build()
+                _cancel_build(job.engine)
             job.task.cancel()
             tasks.append(job.task)
     return tasks
@@ -1440,13 +1610,13 @@ def _stop_vllm_models(names: set[str]) -> list[str]:
 
 
 def _stop_if_running(engine: Engine, names: set[str]) -> bool:
-    """Stop the vllm containers or the nemo container that run one of names."""
+    """Stop the vllm containers, or the nemo or audio container, that run one of names."""
     if engine == "vllm":
         return bool(_stop_vllm_models(names))
     with _COMPOSE_LOCK:
         if engine not in _running():
             return False
-        if _nemo_model_from_container() not in names:
+        if _single_model(engine) not in names:
             return False
         _stop(engine)
         return True
@@ -1466,7 +1636,7 @@ async def _unload_ollama(name: str) -> None:
 async def model_down(model: str | None = None) -> dict[str, Any]:
     """Stop models and free their GPU memory. With model, stop only that one (pinned or
     not, loaded or still starting) and cancel only its jobs. Without, stop every engine
-    and cancel every pull, up, diarize or transcribe job, as before."""
+    and cancel every pull, up, diarize, transcribe or generate_audio job, as before."""
     _ensure_reconciler()
     if model is None:
         tasks = _cancel([j for j in JOBS.values() if j.state == "running"])
@@ -1502,7 +1672,7 @@ async def model_down(model: str | None = None) -> dict[str, Any]:
     async with _RECONCILE_LOCK:
         # Go by what the engines run, not the ledger: a model still starting (or
         # one whose job was just cancelled) may have no ledger entry.
-        for engine in ("vllm", "nemo"):
+        for engine in ("vllm", *SINGLE):
             if await asyncio.to_thread(_stop_if_running, engine, names):
                 stopped.append(f"{engine}:{model}")
         loaded = {(m.get("name") or m.get("model")) for m in await _ollama_ps()}
@@ -1614,10 +1784,49 @@ async def transcribe(
 
 
 @mcp.tool()
+async def generate_audio(
+    prompt: str,
+    duration_s: float = 5.0,
+    seed: StrictInt | None = None,
+    cfg_coef: float = 3.0,
+    evict: Evict = "never",
+) -> dict[str, Any]:
+    """Generate a sound effect from an English text prompt with the audio engine
+    (model_up engine=audio model=facebook/audiogen-medium first), e.g. "dog barking in
+    the distance, light rain". duration_s is 0.5 to 30; AudioGen is trained on 10 s
+    clips and extends longer ones, which takes longer and drifts more. seed makes a run
+    repeatable (the result gives the one used); cfg_coef (0 to 10, default 3) is how
+    closely it follows the prompt. A run needs some GPU memory on top of the model; if
+    that does not fit, the job fails with a plan, and evict="auto" lets it stop least
+    recently used models. One clip at a time; later ones wait. Returns a job; when it is
+    done, result.url is a 16 kHz mono WAV to download (kept 24 hours), with seed,
+    audio_s and elapsed_s. Output is licensed CC BY-NC 4.0 (the model's license)."""
+    _ensure_reconciler()
+    await _reconcile()
+    prompt = prompt.strip()
+    if not prompt or len(prompt) > AUDIO_MAX_PROMPT:
+        raise ToolError(f"prompt must be 1 to {AUDIO_MAX_PROMPT} characters")
+    if not AUDIO_MIN_S <= duration_s <= AUDIO_MAX_S:
+        raise ToolError(f"duration_s must be from {AUDIO_MIN_S:g} to {AUDIO_MAX_S:g}, not {duration_s:g}")
+    if not 0 <= cfg_coef <= 10:
+        raise ToolError(f"cfg_coef must be from 0 to 10, not {cfg_coef:g}")
+    if seed is not None and not 0 <= seed < 2**31:
+        raise ToolError("seed must be from 0 to 2147483647")
+    inst = _up_instance("audio", lambda m: True)
+    if inst is None:
+        raise ToolError(f"audio is not up: run model_up engine=audio model={next(iter(AUDIO_REPOS))} first")
+    if inst.key in EVICTING:
+        raise ToolError(f"{inst.model} is being stopped to make room for another model")
+    job = Job("generate", "audio", inst.model, instance=inst.key)
+    inst.last_used = time.time()
+    return _start_job(job, lambda j: _generate(j, prompt, duration_s, seed, cfg_coef, evict))
+
+
+@mcp.tool()
 async def job_status(job_id: str, wait_seconds: int = 30) -> dict[str, Any]:
-    """Progress of a pull, up, diarize or transcribe job. Blocks up to wait_seconds (max 120)
-    for it to finish. A finished diarize or transcribe job carries its output in result;
-    a refused one carries the plan."""
+    """Progress of a pull, up, diarize, transcribe or generate job. Blocks up to
+    wait_seconds (max 120) for it to finish. A finished diarize, transcribe or generate
+    job carries its output in result; a refused one carries the plan."""
     job = JOBS.get(job_id)
     if job is None:
         raise ToolError(f"no job {job_id}; jobs do not survive a server restart")
@@ -1647,6 +1856,26 @@ async def health(_: Request) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+@mcp.custom_route("/files/{name}", methods=["GET"])
+async def files(request: Request) -> Response:
+    """A WAV generate_audio made. Same Host check as /mcp, so a web page cannot read
+    it through DNS rebinding; names are random and unlisted."""
+    if request.headers.get("host") not in LOCAL_HOSTS:
+        return JSONResponse({"error": "forbidden host"}, status_code=421)
+    name = request.path_params.get("name", "")
+    path = OUT / name
+    gone = JSONResponse({"error": "no such file; generated files are kept 24 hours"}, status_code=404)
+    if not OUT_NAME.fullmatch(name):
+        return gone
+    try:
+        st = path.stat()  # once: a prune may remove it at any moment
+    except OSError:
+        return gone
+    if not stat.S_ISREG(st.st_mode) or time.time() - st.st_mtime > OUT_KEEP_SECS:
+        return gone
+    return FileResponse(path, media_type="audio/wav", filename=name)
+
+
 if __name__ == "__main__":
     # Audio a previous run was working on when it stopped.
     for leftover in Path(WORK).glob(f"{AUDIO_TMP_PREFIX}*"):
@@ -1654,6 +1883,8 @@ if __name__ == "__main__":
     # Job directories are 0700 once decoded; the decoder may enter only its own.
     with contextlib.suppress(OSError):
         os.chmod(WORK, 0o711)
+    with contextlib.suppress(OSError):
+        _prune_out()
     mcp.run(
         "streamable-http",
         host="0.0.0.0",
@@ -1663,7 +1894,7 @@ if __name__ == "__main__":
         # Published on 127.0.0.1 only; still refuse other Host headers so a web
         # page cannot reach it through DNS rebinding.
         transport_security=TransportSecuritySettings(
-            allowed_hosts=[f"localhost:{PORT}", f"127.0.0.1:{PORT}"],
+            allowed_hosts=LOCAL_HOSTS,
             allowed_origins=[f"http://localhost:{PORT}", f"http://127.0.0.1:{PORT}"],
         ),
     )

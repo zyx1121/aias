@@ -124,6 +124,54 @@ class NemoBurst(unittest.TestCase):
         self.assertEqual(vram.nemo_burst_mib(5203, 39.2), 3400)  # rounded up
 
 
+class AudioBurst(unittest.TestCase):
+    def test_covers_what_king_measured(self):
+        # 368 MiB at 5 s, 732 at 10 s, 1488 at 30 s (RTX 3080, AudioGen medium).
+        for seconds, measured in [(5, 368), (10, 732), (30, 1488)]:
+            with self.subTest(seconds=seconds):
+                self.assertGreaterEqual(vram.audio_burst_mib(seconds), measured)
+        self.assertEqual(vram.audio_burst_mib(0.5), vram.AUDIO_BURST_FLOOR_MIB)
+
+    def test_slower_past_the_window(self):
+        per_s_inside = vram.audio_burst_mib(10) - vram.audio_burst_mib(9)
+        per_s_past = vram.audio_burst_mib(21) - vram.audio_burst_mib(20)
+        self.assertLess(per_s_past, per_s_inside)
+
+    def test_factor_raises_but_never_lowers(self):
+        self.assertEqual(vram.audio_burst_mib(10, 1.5), 1140)
+        self.assertEqual(vram.audio_burst_mib(10, 0.5), vram.audio_burst_mib(10))
+
+    def test_only_long_enough_clips_set_the_factor(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            store = vram.Store(Path(tmp) / "vram.json")
+            store.record_audio_burst("m", 900, 2)
+            self.assertIsNone(store.audio_burst_factor("m"))
+            store.record_audio_burst("m", 700, 10)  # under the estimate: nothing to raise
+            self.assertIsNone(store.audio_burst_factor("m"))
+            store.record_audio_burst("m", 1140, 10)
+            store.record_audio_burst("m", 1600, 30)  # a lower ratio: the highest stays
+            self.assertEqual(store.audio_burst_factor("m"), 1.5)
+            self.assertEqual(vram.Store(Path(tmp) / "vram.json").audio_burst_factor("m"), 1.5)
+
+    def test_bad_state_field_dropped(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vram.json"
+            path.write_text('{"audio_burst_factor": {"m": "big"}}')
+            with self.assertLogs("aias.vram", "WARNING"):
+                self.assertEqual(vram.Store(path).data["audio_burst_factor"], {})
+
+    def test_does_not_fit_next_to_whisper_on_10_gb(self):
+        # Whisper 4187 + AudioGen 5440 is over the 8704 MiB budget: model_up must
+        # refuse with Whisper in the eviction plan, not overcommit the card.
+        p = plan(vram.AUDIO_BASE_MIB, 4187, [Candidate("whisper", 4187, 1)])
+        self.assertFalse(p.fits)
+        self.assertEqual(p.evict, ["whisper"])
+
+
 class DiarizeCapacity(unittest.TestCase):
     def cap(self, reserved, rate=39.3, smi_free=None, pressure=False):
         return vram.diarize_capacity_min(rate, BUDGET, reserved, smi_free, pressure, 120)

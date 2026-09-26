@@ -47,6 +47,19 @@ NEMO_BURST_MIB_PER_MIN = 40
 # and no reservation is smaller than the floor.
 NEMO_BURST_MIN_AUDIO_S = 600
 NEMO_BURST_FLOOR_MIB = 128
+# audio (AudioGen medium) with the model loaded and no job, at the nvidia-smi
+# level: 5431 to 5441 MiB over 3 starts on king (LM fp16 3457, t5-large 1278,
+# EnCodec 225 and the CUDA context).
+AUDIO_BASE_MIB = int(os.environ.get("AIAS_AUDIO_BASE_MIB", "5440"))
+# A generation's burst grows with the clip: steeply up to AudioGen's 10 s window
+# (KV cache), then slower as longer clips are extended 5 s at a time. Measured on
+# king: 368 MiB at 5 s, 732 at 10 s, 1488 at 30 s; the rates cover each.
+AUDIO_WINDOW_S = 10.0
+AUDIO_BURST_MIB_PER_S = 76  # up to the window
+AUDIO_BURST_EXTEND_MIB_PER_S = 40  # past it
+AUDIO_BURST_FLOOR_MIB = 128
+# Only clips this long set the measured factor; shorter ones are mostly noise.
+AUDIO_BURST_MIN_S = 5.0
 
 STATE_FILE = Path(os.environ.get("AIAS_STATE", "/state")) / "vram.json"
 # Up to this many evictable models, the plan tries every subset for the fewest
@@ -72,6 +85,16 @@ def smi() -> dict[str, Any] | None:
         return None
     name, used, total, free = (x.strip() for x in out.stdout.splitlines()[0].split(","))
     return {"name": name, "used": int(used), "total": int(total), "free": int(free)}
+
+
+def compute_cap() -> float | None:
+    """The card's CUDA compute capability (8.6 for an RTX 3080)."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=15)
+        return float(out.stdout.splitlines()[0])
+    except (OSError, subprocess.TimeoutExpired, ValueError, IndexError):
+        return None
 
 
 def budget(total_mib: int) -> int:
@@ -113,6 +136,19 @@ def nemo_burst_mib(audio_s: float, measured_per_min: float | None = None) -> int
     a measured run, else NEMO_BURST_MIB_PER_MIN."""
     # Rounded up, so a file fits exactly when rate x minutes fits.
     return max(NEMO_BURST_FLOOR_MIB, math.ceil(burst_rate(measured_per_min) * audio_s / 60))
+
+
+def audio_burst_estimate_mib(duration_s: float) -> float:
+    inside = min(duration_s, AUDIO_WINDOW_S)
+    return AUDIO_BURST_MIB_PER_S * inside + AUDIO_BURST_EXTEND_MIB_PER_S * (duration_s - inside)
+
+
+def audio_burst_mib(duration_s: float, measured_factor: float | None = None) -> int:
+    """Memory one generate_audio run adds on top of the idle engine: the estimate
+    for the clip's length, scaled up (never down) by the highest measured/estimate
+    ratio seen on this card."""
+    factor = max(1.0, measured_factor or 1.0)
+    return max(AUDIO_BURST_FLOOR_MIB, math.ceil(audio_burst_estimate_mib(duration_s) * factor))
 
 
 def burst_rate(measured_per_min: float | None) -> float:
@@ -165,7 +201,7 @@ class Store:
 
     @staticmethod
     def _defaults() -> dict[str, Any]:
-        return {"measured": {}, "nemo_burst_per_min": {}, "pins": [], "managed_ollama": []}
+        return {"measured": {}, "nemo_burst_per_min": {}, "audio_burst_factor": {}, "pins": [], "managed_ollama": []}
 
     def _adopt(self, loaded: Any) -> None:
         """Take each field of the state file only if it has the right shape, so a
@@ -181,6 +217,9 @@ class Store:
             "measured": lambda v: isinstance(v, dict) and all(isinstance(k, str) and good_record(r) for k, r in v.items()),
             # burst_per_min, the field before, also took short files' rates; not read.
             "nemo_burst_per_min": lambda v: isinstance(v, dict) and all(
+                isinstance(k, str) and isinstance(r, (int, float)) and r > 0 for k, r in v.items()
+            ),
+            "audio_burst_factor": lambda v: isinstance(v, dict) and all(
                 isinstance(k, str) and isinstance(r, (int, float)) and r > 0 for k, r in v.items()
             ),
             "pins": lambda v: isinstance(v, list) and all(isinstance(x, str) for x in v),
@@ -222,6 +261,19 @@ class Store:
         per_min = burst_mib / (audio_s / 60)
         if per_min > (self.burst_rate(model) or 0):
             self.data["nemo_burst_per_min"][model] = round(per_min, 2)
+            self.save()
+
+    def audio_burst_factor(self, model: str) -> float | None:
+        return self.data["audio_burst_factor"].get(model)
+
+    def record_audio_burst(self, model: str, burst_mib: float, audio_s: float) -> None:
+        """Keep the highest measured/estimate ratio of a long enough clip, so a card
+        that needs more than the estimate raises every later reservation."""
+        if audio_s < AUDIO_BURST_MIN_S:
+            return
+        factor = burst_mib / audio_burst_estimate_mib(audio_s)
+        if factor > (self.audio_burst_factor(model) or 1.0):
+            self.data["audio_burst_factor"][model] = round(factor, 3)
             self.save()
 
     def _toggle(self, name: str, item: str, on: bool) -> None:

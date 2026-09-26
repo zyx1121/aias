@@ -29,6 +29,7 @@ Source: "..\scripts\*"; DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "..\wsl\*"; DestDir: "{app}\wsl"; Flags: ignoreversion
 Source: "..\mcp\*"; DestDir: "{app}\mcp"; Flags: ignoreversion
 Source: "..\nemo\*"; DestDir: "{app}\nemo"; Flags: ignoreversion
+Source: "..\audio\*"; DestDir: "{app}\audio"; Flags: ignoreversion
 Source: "..\decoder\*"; DestDir: "{app}\decoder"; Flags: ignoreversion
 
 [UninstallRun]
