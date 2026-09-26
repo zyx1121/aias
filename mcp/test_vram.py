@@ -124,36 +124,45 @@ class NemoBurst(unittest.TestCase):
         self.assertEqual(vram.nemo_burst_mib(5203, 39.2), 3400)  # rounded up
 
 
+AG = "facebook/audiogen-medium"
+# (model, clip seconds, burst MiB) measured on king, RTX 3080.
+MEASURED_BURSTS = [
+    (AG, 5, 370), (AG, 10, 732), (AG, 30, 1488),
+    ("facebook/musicgen-medium", 5, 428), ("facebook/musicgen-medium", 10, 972),
+    ("facebook/musicgen-medium", 30, 2718),
+]
+
+
 class AudioBurst(unittest.TestCase):
     def test_covers_what_king_measured(self):
-        # 368 MiB at 5 s, 732 at 10 s, 1488 at 30 s (RTX 3080, AudioGen medium).
-        for seconds, measured in [(5, 368), (10, 732), (30, 1488)]:
+        # 370 MiB at 5 s, 732 at 10 s, 1488 at 30 s (RTX 3080, AudioGen medium).
+        for seconds, measured in [(5, 370), (10, 732), (30, 1488)]:
             with self.subTest(seconds=seconds):
-                self.assertGreaterEqual(vram.audio_burst_mib(seconds), measured)
-        self.assertEqual(vram.audio_burst_mib(0.5), vram.AUDIO_BURST_FLOOR_MIB)
+                self.assertGreaterEqual(vram.audio_burst_mib(AG, seconds), measured)
+        self.assertEqual(vram.audio_burst_mib(AG, 0.5), vram.AUDIO_BURST_FLOOR_MIB)
 
     def test_slower_past_the_window(self):
-        per_s_inside = vram.audio_burst_mib(10) - vram.audio_burst_mib(9)
-        per_s_past = vram.audio_burst_mib(21) - vram.audio_burst_mib(20)
+        per_s_inside = vram.audio_burst_mib(AG, 10) - vram.audio_burst_mib(AG, 9)
+        per_s_past = vram.audio_burst_mib(AG, 21) - vram.audio_burst_mib(AG, 20)
         self.assertLess(per_s_past, per_s_inside)
 
     def test_factor_raises_but_never_lowers(self):
-        self.assertEqual(vram.audio_burst_mib(10, 1.5), 1140)
-        self.assertEqual(vram.audio_burst_mib(10, 0.5), vram.audio_burst_mib(10))
+        self.assertEqual(vram.audio_burst_mib(AG, 10, 1.5), 1140)
+        self.assertEqual(vram.audio_burst_mib(AG, 10, 0.5), vram.audio_burst_mib(AG, 10))
 
     def test_only_long_enough_clips_set_the_factor(self):
         import tempfile
         from pathlib import Path
         with tempfile.TemporaryDirectory() as tmp:
             store = vram.Store(Path(tmp) / "vram.json")
-            store.record_audio_burst("m", 900, 2)
-            self.assertIsNone(store.audio_burst_factor("m"))
-            store.record_audio_burst("m", 700, 10)  # under the estimate: nothing to raise
-            self.assertIsNone(store.audio_burst_factor("m"))
-            store.record_audio_burst("m", 1140, 10)
-            store.record_audio_burst("m", 1600, 30)  # a lower ratio: the highest stays
-            self.assertEqual(store.audio_burst_factor("m"), 1.5)
-            self.assertEqual(vram.Store(Path(tmp) / "vram.json").audio_burst_factor("m"), 1.5)
+            store.record_audio_burst(AG, 900, 2)
+            self.assertIsNone(store.audio_burst_factor(AG))
+            store.record_audio_burst(AG, 700, 10)  # under the estimate: nothing to raise
+            self.assertIsNone(store.audio_burst_factor(AG))
+            store.record_audio_burst(AG, 1140, 10)
+            store.record_audio_burst(AG, 1600, 30)  # a lower ratio: the highest stays
+            self.assertEqual(store.audio_burst_factor(AG), 1.5)
+            self.assertEqual(vram.Store(Path(tmp) / "vram.json").audio_burst_factor(AG), 1.5)
 
     def test_bad_state_field_dropped(self):
         import tempfile
@@ -164,10 +173,19 @@ class AudioBurst(unittest.TestCase):
             with self.assertLogs("aias.vram", "WARNING"):
                 self.assertEqual(vram.Store(path).data["audio_burst_factor"], {})
 
+    def test_unknown_model_budgeted_as_the_largest(self):
+        largest = max(b.base_mib for b in vram.AUDIO_BUDGETS.values())
+        self.assertEqual(vram.audio_base_mib("someone/else"), largest)
+
+    def test_every_model_covers_its_measured_bursts(self):
+        for model, seconds, measured in MEASURED_BURSTS:
+            with self.subTest(model=model, seconds=seconds):
+                self.assertGreaterEqual(vram.audio_burst_mib(model, seconds), measured)
+
     def test_does_not_fit_next_to_whisper_on_10_gb(self):
-        # Whisper 4187 + AudioGen 5440 is over the 8704 MiB budget: model_up must
+        # Whisper 4187 + AudioGen 5570 (or MusicGen 4740) is over the 8704 MiB budget: model_up must
         # refuse with Whisper in the eviction plan, not overcommit the card.
-        p = plan(vram.AUDIO_BASE_MIB, 4187, [Candidate("whisper", 4187, 1)])
+        p = plan(vram.audio_base_mib(AG), 4187, [Candidate("whisper", 4187, 1)])
         self.assertFalse(p.fits)
         self.assertEqual(p.evict, ["whisper"])
 

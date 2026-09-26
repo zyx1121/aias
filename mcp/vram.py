@@ -47,16 +47,34 @@ NEMO_BURST_MIB_PER_MIN = 40
 # and no reservation is smaller than the floor.
 NEMO_BURST_MIN_AUDIO_S = 600
 NEMO_BURST_FLOOR_MIB = 128
-# audio (AudioGen medium) with the model loaded and no job, at the nvidia-smi
-# level: 5431 to 5441 MiB over 3 starts on king (LM fp16 3457, t5-large 1278,
-# EnCodec 225 and the CUDA context).
-AUDIO_BASE_MIB = int(os.environ.get("AIAS_AUDIO_BASE_MIB", "5440"))
-# A generation's burst grows with the clip: steeply up to AudioGen's 10 s window
-# (KV cache), then slower as longer clips are extended 5 s at a time. Measured on
-# king: 368 MiB at 5 s, 732 at 10 s, 1488 at 30 s; the rates cover each.
-AUDIO_WINDOW_S = 10.0
-AUDIO_BURST_MIB_PER_S = 76  # up to the window
-AUDIO_BURST_EXTEND_MIB_PER_S = 40  # past it
+
+
+@dataclass(frozen=True)
+class AudioBudget:
+    """One audio model: its idle footprint at the nvidia-smi level, and the burst a
+    clip adds, fixed_mib + per_s up to window_s + extend_per_s past it."""
+
+    base_mib: int
+    per_s: float
+    window_s: float = 0.0
+    extend_per_s: float = 0.0
+    fixed_mib: int = 0
+
+
+AUDIO_BUDGETS: dict[str, AudioBudget] = {
+    # Idle is measured on king after the engine's warmup clip, which leaves about
+    # 120 MiB of CUDA workspace for good.
+    # AudioGen: 5441 MiB loaded (LM fp16 3457, t5-large 1278, EnCodec 225, the CUDA
+    # context), 5562 after a clip. The burst grows steeply up to the 10 s window
+    # (KV cache), then slower as longer clips are extended 5 s at a time: 370 MiB
+    # at 5 s, 732 at 10 s, 1488 at 30 s; the rates cover each.
+    "facebook/audiogen-medium": AudioBudget(5570, 76, 10.0, 40),
+    # MusicGen: 4613 MiB loaded, 4736 after a clip. Trained on 30 s clips, so its
+    # burst grows all the way: 428 MiB at 5 s, 930 to 972 at 10 s, 2718 at 30 s.
+    "facebook/musicgen-medium": AudioBudget(4740, 100),
+}
+# A model without a measured entry is budgeted like the largest known one.
+AUDIO_FALLBACK = max(AUDIO_BUDGETS.values(), key=lambda b: b.base_mib)
 AUDIO_BURST_FLOOR_MIB = 128
 # Only clips this long set the measured factor; shorter ones are mostly noise.
 AUDIO_BURST_MIN_S = 5.0
@@ -138,17 +156,22 @@ def nemo_burst_mib(audio_s: float, measured_per_min: float | None = None) -> int
     return max(NEMO_BURST_FLOOR_MIB, math.ceil(burst_rate(measured_per_min) * audio_s / 60))
 
 
-def audio_burst_estimate_mib(duration_s: float) -> float:
-    inside = min(duration_s, AUDIO_WINDOW_S)
-    return AUDIO_BURST_MIB_PER_S * inside + AUDIO_BURST_EXTEND_MIB_PER_S * (duration_s - inside)
+def audio_base_mib(model: str) -> int:
+    return AUDIO_BUDGETS.get(model, AUDIO_FALLBACK).base_mib
 
 
-def audio_burst_mib(duration_s: float, measured_factor: float | None = None) -> int:
+def audio_burst_estimate_mib(model: str, duration_s: float) -> float:
+    b = AUDIO_BUDGETS.get(model, AUDIO_FALLBACK)
+    inside = min(duration_s, b.window_s) if b.window_s else duration_s
+    return b.fixed_mib + b.per_s * inside + b.extend_per_s * (duration_s - inside)
+
+
+def audio_burst_mib(model: str, duration_s: float, measured_factor: float | None = None) -> int:
     """Memory one generate_audio run adds on top of the idle engine: the estimate
     for the clip's length, scaled up (never down) by the highest measured/estimate
     ratio seen on this card."""
     factor = max(1.0, measured_factor or 1.0)
-    return max(AUDIO_BURST_FLOOR_MIB, math.ceil(audio_burst_estimate_mib(duration_s) * factor))
+    return max(AUDIO_BURST_FLOOR_MIB, math.ceil(audio_burst_estimate_mib(model, duration_s) * factor))
 
 
 def burst_rate(measured_per_min: float | None) -> float:
@@ -271,7 +294,7 @@ class Store:
         that needs more than the estimate raises every later reservation."""
         if audio_s < AUDIO_BURST_MIN_S:
             return
-        factor = burst_mib / audio_burst_estimate_mib(audio_s)
+        factor = burst_mib / audio_burst_estimate_mib(model, audio_s)
         if factor > (self.audio_burst_factor(model) or 1.0):
             self.data["audio_burst_factor"][model] = round(factor, 3)
             self.save()
